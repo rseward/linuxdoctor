@@ -1,7 +1,9 @@
 """Tests for the CLI module."""
 
+import json
 import pytest
 from click.testing import CliRunner
+from unittest.mock import patch
 from linuxdoctor.cli import cli
 
 
@@ -14,6 +16,7 @@ class TestCli:
         assert result.exit_code == 0
         assert "analyze" in result.output
         assert "analyzenode" in result.output
+        assert "list-hosts" in result.output
 
     def test_analyze_help(self):
         runner = CliRunner()
@@ -34,7 +37,6 @@ class TestCli:
         runner = CliRunner()
         result = runner.invoke(cli, ["analyze", "--json-output"])
         assert result.exit_code == 0
-        import json
         data = json.loads(result.output)
         assert "host" in data
         assert "metrics" in data
@@ -62,6 +64,21 @@ class TestCli:
         assert result.exit_code == 0
         assert "NODE_ADDRESS" in result.output
         assert "--port" in result.output
+        assert "--threshold" in result.output
+        assert "--verbose" in result.output
+
+    def test_analyzenode_nonexistent_host(self):
+        runner = CliRunner()
+        result = runner.invoke(cli, ["analyzenode", "192.0.2.1", "--port", "9999"])
+        # Should output an error (exit code 0 since we don't auto-exit on error in CLI)
+        assert "Error" in result.output or "error" in result.output.lower()
+
+    def test_list_hosts_help(self):
+        runner = CliRunner()
+        result = runner.invoke(cli, ["list-hosts", "--help"])
+        assert result.exit_code == 0
+        assert "PROMETHEUS_URL" in result.output
+        assert "--timeout" in result.output
 
     def test_version(self):
         runner = CliRunner()

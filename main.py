@@ -1,6 +1,6 @@
-def main():
-    print("Hello from drlinux2!")
+"""Entry point for linuxdoctor when run as `python -m linuxdoctor`."""
 
+from linuxdoctor.cli import cli
 
 if __name__ == "__main__":
-    main()
+    cli()
