@@ -43,12 +43,23 @@ def analyze(json_output, no_recs, check, threshold):
 @click.option("--no-recommendations", "no_recs", is_flag=True, help="Skip recommendation generation")
 @click.option("--threshold", "-t", default="default", help="Threshold profile: default, strict, or relaxed")
 @click.option("--verbose", "-v", is_flag=True, help="Show verbose output")
-def analyzenode(node_address, port, json_output, no_recs, threshold, verbose):
+@click.option("--resample", is_flag=True, help="Take two samples to compute rates for counter metrics (context switches, disk I/O)")
+@click.option("--resample-interval", "resample_interval", default=None, type=int, help="Seconds between samples (default: 30, requires --resample)")
+def analyzenode(node_address, port, json_output, no_recs, threshold, verbose, resample, resample_interval):
     """Analyze a remote node using node_exporter metrics.
 
     NODE_ADDRESS is the hostname or IP of the target node.
 
     Example: linuxdoctor analyzenode server.example.com
+
+    For accurate counter-based metrics (context switches, disk I/O), use --resample
+    to take two samples and compute rates:
+
+        linuxdoctor analyzenode server.example.com --resample
+
+    Register host metadata for better context switch analysis:
+
+        linuxdoctor registerhost server.example.com --cpu-cores 8
     """
     from linuxdoctor.analyzenode import analyze_remote_node
     result = analyze_remote_node(
@@ -58,6 +69,8 @@ def analyzenode(node_address, port, json_output, no_recs, threshold, verbose):
         include_recommendations=not no_recs,
         threshold_profile=threshold,
         verbose=verbose,
+        resample=resample,
+        resample_interval=resample_interval,
     )
     click.echo(result)
 
@@ -111,3 +124,99 @@ def list_hosts(prometheus_url, timeout):
     for host in hosts[:3]:  # Show examples for up to 3 hosts
         click.echo(f"   linuxdoctor analyzenode {host.host}")
     click.echo("=" * 50)
+
+
+# ---------------------------------------------------------------------------
+# registerhost command
+# ---------------------------------------------------------------------------
+
+@cli.command()
+@click.argument("host")
+@click.option("--cpu-cores", "cpu_cores", type=int, help="Number of CPU cores (logical processors)")
+@click.option("--cpu-sockets", "cpu_sockets", type=int, help="Number of physical CPU sockets")
+@click.option("--description", "-d", help="Human-readable description of the host")
+@click.option("--registry", "registry_path", default=None, help="Path to the host registry YAML file")
+def registerhost(host, cpu_cores, cpu_sockets, description, registry_path):
+    """Register host metadata for more accurate analysis.
+
+    HOST is the hostname or IP address of the target node.
+
+    This stores metadata (like CPU core count) that linuxdoctor uses to
+    improve the accuracy of context switch and other per-core metrics.
+    Without registered core count, context switch thresholds use less
+    accurate absolute values.
+
+    Examples:
+
+        linuxdoctor registerhost server1 --cpu-cores 8
+        linuxdoctor registerhost 192.168.1.5 --cpu-cores 16 --cpu-sockets 2
+        linuxdoctor registerhost db-main --cpu-cores 32 -d "Production DB server"
+    """
+    from linuxdoctor.host_registry import register_host as _register_host
+    from linuxdoctor.host_registry import DEFAULT_REGISTRY_PATH as _default_path
+
+    path = registry_path or _default_path
+
+    if cpu_cores is None and cpu_sockets is None and description is None:
+        click.echo("⚠️  No metadata specified. Use --cpu-cores, --cpu-sockets, or --description.")
+        click.echo(f"   Example: linuxdoctor registerhost {host} --cpu-cores 8")
+        sys.exit(1)
+
+    try:
+        entry = _register_host(
+            host=host,
+            cpu_cores=cpu_cores,
+            cpu_sockets=cpu_sockets,
+            description=description,
+            path=path,
+        )
+        click.echo(f"✅ Registered {host}:")
+        for key, value in entry.items():
+            click.echo(f"   {key}: {value}")
+        click.echo(f"   Registry: {path}")
+    except Exception as e:
+        click.echo(f"❌ Failed to register {host}: {e}")
+        sys.exit(2)
+
+
+@cli.command("list-registered")
+@click.option("--registry", "registry_path", default=None, help="Path to the host registry YAML file")
+def list_registered(registry_path):
+    """List all registered hosts and their metadata."""
+    from linuxdoctor.host_registry import list_hosts as _list_hosts, DEFAULT_REGISTRY_PATH as _default_path
+
+    path = registry_path or _default_path
+    hosts = _list_hosts(path=path)
+
+    if not hosts:
+        click.echo(f"📋 No hosts registered. Registry: {path}")
+        click.echo("   Use `linuxdoctor registerhost HOST --cpu-cores N` to register a host.")
+        return
+
+    click.echo(f"📋 Registered hosts ({len(hosts)}):")
+    click.echo("=" * 50)
+    for host, info in hosts.items():
+        click.echo(f"  {host}:")
+        for key, value in info.items():
+            click.echo(f"    {key}: {value}")
+    click.echo("=" * 50)
+    click.echo(f"Registry: {path}")
+
+
+@cli.command("unregisterhost")
+@click.argument("host")
+@click.option("--registry", "registry_path", default=None, help="Path to the host registry YAML file")
+def unregisterhost(host, registry_path):
+    """Remove a host from the registry.
+
+    HOST is the hostname or IP address to remove.
+    """
+    from linuxdoctor.host_registry import unregister_host as _unregister_host, DEFAULT_REGISTRY_PATH as _default_path
+
+    path = registry_path or _default_path
+
+    if _unregister_host(host, path=path):
+        click.echo(f"✅ Removed {host} from registry.")
+    else:
+        click.echo(f"⚠️  {host} not found in registry.")
+        sys.exit(1)

@@ -35,6 +35,49 @@ linuxdoctor analyzenode server.example.com --no-recommendations
 
 Connects to a Prometheus node_exporter endpoint on the remote host and analyzes CPU, memory, disk, disk I/O, network, and context switching metrics with threshold-based recommendations.
 
+#### Counter-Aware Analysis (--resample)
+
+Many node_exporter metrics are **cumulative counters** (monotonically increasing since boot):
+
+- `node_cpu_seconds_total` — cumulative CPU time by mode
+- `node_context_switches_total` — cumulative context switches since boot
+- `node_disk_io_time_seconds_total` — cumulative disk I/O time
+
+Reading these values directly produces **false positives** on long-running systems. For example, 500 million context switches is normal for a system that's been up 30 days — it means nothing without computing a rate.
+
+Use `--resample` to take two samples and compute accurate rates:
+
+```bash
+# Take two samples 30 seconds apart (default)
+linuxdoctor analyzenode server.example.com --resample
+
+# Custom interval (60 seconds between samples)
+linuxdoctor analyzenode server.example.com --resample --resample-interval 60
+```
+
+Without `--resample`, counter-based metrics show informational messages rather than potentially misleading warnings.
+
+#### Registering Host Metadata (registerhost)
+
+Context switch analysis is most accurate when normalized per CPU core. node_exporter exposes logical CPU count, but physical core count can differ (e.g., with hyperthreading). Register your host's actual core count for better accuracy:
+
+```bash
+# Register a host with its CPU core count
+linuxdoctor registerhost server1 --cpu-cores 8
+linuxdoctor registerhost 192.168.1.5 --cpu-cores 16 --cpu-sockets 2
+linuxdoctor registerhost db-main --cpu-cores 32 -d "Production DB server"
+
+# List registered hosts
+linuxdoctor list-registered
+
+# Remove a host
+linuxdoctor unregisterhost server1
+```
+
+When context switch warnings are triggered without a registered core count, linuxdoctor will suggest using `registerhost` to improve accuracy.
+
+Registry data is stored in `~/.config/linuxdoctor/hosts.yaml`.
+
 ### List hosts from Prometheus
 
 ```bash
@@ -47,9 +90,14 @@ Discovers available hosts from a Prometheus server's targets API.
 
 ## CLI Commands
 
-- `analyze` — Analyze the current host using local performance tools
-- `analyzenode` — Analyze a remote node using node_exporter metrics
-- `list-hosts` — List available hosts from a Prometheus server
+| Command | Description |
+|---------|-------------|
+| `analyze` | Analyze the current host using local performance tools |
+| `analyzenode` | Analyze a remote node using node_exporter metrics |
+| `list-hosts` | List available hosts from a Prometheus server |
+| `registerhost` | Register host metadata (CPU cores, etc.) for more accurate analysis |
+| `list-registered` | List all registered hosts and their metadata |
+| `unregisterhost` | Remove a host from the registry |
 
 ## Options
 
@@ -59,6 +107,33 @@ Discovers available hosts from a Prometheus server's targets API.
 - `--threshold` / `-t` — Threshold profile: default, strict, or relaxed
 - `--verbose` / `-v` — Show verbose output (analyzenode)
 - `--port` / `-p` — Node exporter port (default: 9100, analyzenode only)
+- `--resample` — Take two samples to compute rates for counter metrics (analyzenode only)
+- `--resample-interval` — Seconds between resamples (default: 30, requires --resample)
+
+## Threshold Profiles
+
+Three built-in threshold profiles are available:
+
+### Context Switch Thresholds (per-core, rate-based)
+
+| Level | Default | Strict | Relaxed |
+|-------|---------|--------|---------|
+| Warning (per core/sec) | 1,000 | 500 | 2,000 |
+| Critical (per core/sec) | 5,000 | 2,000 | 10,000 |
+| Warning (absolute/sec, no cores) | 10,000 | 5,000 | 20,000 |
+
+### I/O Wait Thresholds (% of CPU time)
+
+| Level | Default | Strict | Relaxed |
+|-------|---------|--------|---------|
+| Warning | 20% | 10% | 40% |
+
+### Disk I/O Utilization Thresholds (% busy, rate-based)
+
+| Level | Default | Strict | Relaxed |
+|-------|---------|--------|---------|
+| Warning | 70% | 50% | 85% |
+| Critical | 90% | 70% | 95% |
 
 ## Project Structure
 
@@ -68,13 +143,28 @@ src/linuxdoctor/
 ├── cli.py               # Click CLI entry point
 ├── analyze.py            # Local host analysis (sar, vmstat, etc.)
 ├── analyzenode.py        # Remote node analysis (node_exporter)
-│                        #   Analysis functions return AnalysisResult objects
-│                        #   Formatting separated into _format_human/_format_json
+│                        #   Counter-aware: uses rate() for counters, not raw values
+│                        #   Supports --resample for two-sample rate computation
 ├── collectors.py         # Local metric collectors
+├── host_registry.py      # Host metadata registry (CPU cores, etc.)
 ├── recommendations.py    # Local recommendation engine
 ├── prometheus.py         # Prometheus host discovery
 └── node_analyzer.py      # Re-export of analyzenode for compatibility
 ```
+
+## Counter-Aware Design
+
+linuxdoctor's remote analysis (`analyzenode`) is designed to avoid the common pitfall of comparing cumulative counter values to static thresholds. Key principles:
+
+1. **Never compare raw counter values to thresholds.** Counters like `node_context_switches_total` accumulate since boot — a value of 500M is normal for a 30-day-old system.
+
+2. **Compute rates from two samples.** The `--resample` flag takes two samples spaced `--resample-interval` seconds apart (default 30s) and computes the per-second rate.
+
+3. **Use percentage-of-total for CPU metrics.** Since `node_cpu_seconds_total` has labels for each mode (idle, iowait, system, etc.), dividing iowait by total gives a valid percentage regardless of system uptime.
+
+4. **Normalize by CPU core count.** Context switch rates are meaningless without knowing the number of CPU cores. 10,000 switches/sec might be fine on a 64-core system but terrible on a single-core VM. Use `registerhost` to provide core counts for accurate analysis.
+
+5. **Handle counter resets gracefully.** If the second sample is lower than the first (system rebooted between samples), linuxdoctor uses the current value as a new baseline rather than producing a misleading negative rate.
 
 ## Requirements
 

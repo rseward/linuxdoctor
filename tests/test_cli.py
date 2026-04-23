@@ -85,3 +85,54 @@ class TestCli:
         result = runner.invoke(cli, ["--version"])
         assert result.exit_code == 0
         assert "0.1.0" in result.output
+
+    def test_registerhost_help(self):
+        runner = CliRunner()
+        result = runner.invoke(cli, ["registerhost", "--help"])
+        assert result.exit_code == 0
+        assert "--cpu-cores" in result.output
+        assert "HOST" in result.output
+
+    def test_registerhost_command(self, tmp_path):
+        runner = CliRunner()
+        registry_path = str(tmp_path / "hosts.yaml")
+        result = runner.invoke(cli, ["registerhost", "testhost", "--cpu-cores", "8", "--registry", registry_path])
+        assert result.exit_code == 0
+        assert "Registered" in result.output
+        assert "cpu_cores" in result.output
+
+    def test_registerhost_no_options(self):
+        runner = CliRunner()
+        result = runner.invoke(cli, ["registerhost", "testhost"])
+        assert result.exit_code == 1
+        assert "No metadata" in result.output
+
+    def test_list_registered_empty(self, tmp_path):
+        runner = CliRunner()
+        registry_path = str(tmp_path / "hosts.yaml")
+        result = runner.invoke(cli, ["list-registered", "--registry", registry_path])
+        assert result.exit_code == 0
+        assert "No hosts" in result.output
+
+    def test_unregisterhost_not_found(self, tmp_path):
+        runner = CliRunner()
+        registry_path = str(tmp_path / "hosts.yaml")
+        result = runner.invoke(cli, ["unregisterhost", "nothere", "--registry", registry_path])
+        assert result.exit_code == 1
+
+    def test_register_and_list(self, tmp_path):
+        runner = CliRunner()
+        registry_path = str(tmp_path / "hosts.yaml")
+        # Register a host
+        result = runner.invoke(cli, ["registerhost", "myserver", "--cpu-cores", "4", "--registry", registry_path])
+        assert result.exit_code == 0
+        # List registered hosts
+        result = runner.invoke(cli, ["list-registered", "--registry", registry_path])
+        assert result.exit_code == 0
+        assert "myserver" in result.output
+
+    def test_analyzenode_resample_option(self):
+        runner = CliRunner()
+        result = runner.invoke(cli, ["analyzenode", "--help"])
+        assert result.exit_code == 0
+        assert "--resample" in result.output

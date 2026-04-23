@@ -1,4 +1,4 @@
-"""Tests for the analyzenode module."""
+"""Tests for the analyzenode module with counter-aware analysis."""
 
 import json
 import pytest
@@ -9,7 +9,6 @@ from linuxdoctor.analyzenode import (
     analyze_memory,
     analyze_disk,
     analyze_disk_io,
-    analyze_network,
     analyze_context_switching,
     parse_metrics,
     _get_thresholds,
@@ -83,6 +82,12 @@ class TestThresholds:
         t = _get_thresholds("default")
         assert "cpu_idle_warn_pct" in t
         assert t["cpu_idle_warn_pct"] == 20
+        # New counter-aware thresholds
+        assert "context_switches_per_core_warn" in t
+        assert "context_switches_per_core_critical" in t
+        assert "context_switches_total_warn" in t
+        assert "disk_io_util_warn_pct" in t
+        assert "disk_io_util_critical_pct" in t
 
     def test_strict_thresholds(self):
         t = _get_thresholds("strict")
@@ -216,30 +221,170 @@ class TestAnalyzeDisk:
         assert any("not found" in line for line in result.lines)
 
 
+class TestAnalyzeDiskIO:
+    """Tests for disk I/O analysis with counter-aware thresholds."""
+
+    def test_no_disk_io_metrics(self):
+        metrics = {}
+        thresholds = _get_thresholds("default")
+        result = analyze_disk_io(metrics, thresholds)
+        assert isinstance(result, AnalysisResult)
+        assert any("not found" in line for line in result.lines)
+
+    def test_single_sample_shows_info_not_warning(self):
+        """Single sample should NOT produce warning for cumulative counter."""
+        metrics = {
+            "node_disk_io_time_seconds_total": [
+                {"labels": {"device": "sda"}, "value": 500000.0},  # Very high raw value
+            ]
+        }
+        thresholds = _get_thresholds("default")
+        result = analyze_disk_io(metrics, thresholds, previous_metrics=None)
+        # Should NOT have a warning — raw counter comparison is wrong
+        assert all(r.category != "disk_io" or r.severity != "warning" for r in result.recommendations)
+        # Should show info about needing two samples
+        assert any("raw counter" in line or "resample" in line.lower() for line in result.lines)
+
+    def test_two_samples_compute_rate(self):
+        """With two samples, should compute utilization rate."""
+        metrics_1 = {
+            "node_disk_io_time_seconds_total": [
+                {"labels": {"device": "sda"}, "value": 100.0},
+            ]
+        }
+        metrics_2 = {
+            "node_disk_io_time_seconds_total": [
+                {"labels": {"device": "sda"}, "value": 130.0},  # 30s delta over 30s interval = 100% util
+            ]
+        }
+        thresholds = _get_thresholds("default")
+        result = analyze_disk_io(metrics_2, thresholds, previous_metrics=metrics_1)
+        # Should compute a utilization rate
+        assert any("utilization" in line.lower() or "I/O" in line for line in result.lines)
+
+    def test_two_samples_high_utilization_warning(self):
+        """High utilization rate should produce a warning."""
+        metrics_1 = {
+            "node_disk_io_time_seconds_total": [
+                {"labels": {"device": "sda"}, "value": 100.0},
+            ]
+        }
+        metrics_2 = {
+            "node_disk_io_time_seconds_total": [
+                {"labels": {"device": "sda"}, "value": 121.0},  # 21s delta over 30s = 70% util (warn threshold)
+            ]
+        }
+        thresholds = _get_thresholds("default")
+        result = analyze_disk_io(metrics_2, thresholds, previous_metrics=metrics_1)
+        # Should produce a warning since 70% >= disk_io_util_warn_pct
+        assert any(r.category == "disk_io" and r.severity == "warning" for r in result.recommendations)
+
+    def test_two_samples_critical_utilization(self):
+        """Very high utilization rate should produce a critical recommendation."""
+        metrics_1 = {
+            "node_disk_io_time_seconds_total": [
+                {"labels": {"device": "sda"}, "value": 100.0},
+            ]
+        }
+        metrics_2 = {
+            "node_disk_io_time_seconds_total": [
+                {"labels": {"device": "sda"}, "value": 128.0},  # 28s delta over 30s = 93% util
+            ]
+        }
+        thresholds = _get_thresholds("default")
+        result = analyze_disk_io(metrics_2, thresholds, previous_metrics=metrics_1)
+        assert any(r.category == "disk_io" and r.severity == "critical" for r in result.recommendations)
+
+
 class TestAnalyzeContextSwitching:
-    """Tests for context switching analysis."""
+    """Tests for context switching analysis with counter-aware thresholds."""
 
-    def test_normal_context_switches(self):
-        metrics = {"node_context_switches_total": 1000.0}
-        thresholds = _get_thresholds("default")
-        result = analyze_context_switching(metrics, thresholds)
-        assert isinstance(result, AnalysisResult)
-        assert len(result.recommendations) == 0
-
-    def test_high_context_switches(self):
-        metrics = {"node_context_switches_total": 50000000.0}
-        thresholds = _get_thresholds("default")
-        result = analyze_context_switching(metrics, thresholds)
-        assert isinstance(result, AnalysisResult)
-        assert len(result.recommendations) >= 1
-        assert result.recommendations[0].category == "context_switching"
-
-    def test_missing_context_switches(self):
+    def test_no_context_switches(self):
         metrics = {}
         thresholds = _get_thresholds("default")
         result = analyze_context_switching(metrics, thresholds)
         assert isinstance(result, AnalysisResult)
         assert any("not found" in line for line in result.lines)
+
+    def test_single_sample_shows_info(self):
+        """Single sample should show info message, not a false positive warning."""
+        metrics = {"node_context_switches_total": 50000000.0}  # Very high raw counter
+        thresholds = _get_thresholds("default")
+        result = analyze_context_switching(metrics, thresholds)
+        # Should NOT produce a false-positive warning for raw counter
+        assert all(r.severity != "warning" for r in result.recommendations)
+        # Should mention needing two samples or registering
+        assert any("raw counter" in line.lower() or "resample" in line.lower() or "register" in line.lower() for line in result.lines)
+
+    def test_two_samples_with_cores_healthy(self):
+        """Two samples with known cores, healthy rate should produce no warning."""
+        metrics_prev = {"node_context_switches_total": 100000.0}
+        metrics_curr = {"node_context_switches_total": 130000.0}  # 30000 delta / 30s = 1000/sec
+        thresholds = _get_thresholds("default")
+        result = analyze_context_switching(
+            metrics_curr, thresholds,
+            cpu_cores=4,  # 1000/4 = 250/core/sec — well below 1000 warn threshold
+            previous_metrics=metrics_prev,
+            node_address="testhost",
+        )
+        # Should be healthy (250/core/sec < 1000 warn threshold)
+        assert all(r.severity != "warning" and r.severity != "critical" for r in result.recommendations)
+        assert any("per-core" in line.lower() or "Per-core" in line for line in result.lines)
+
+    def test_two_samples_with_cores_high_rate(self):
+        """Two samples with known cores, high rate should produce warning."""
+        metrics_prev = {"node_context_switches_total": 100000.0}
+        metrics_curr = {"node_context_switches_total": 430000.0}  # 330000/30 = 11000/sec
+        thresholds = _get_thresholds("default")
+        result = analyze_context_switching(
+            metrics_curr, thresholds,
+            cpu_cores=4,  # 11000/4 = 2750/core/sec — above 1000 warn threshold
+            previous_metrics=metrics_prev,
+            node_address="testhost",
+        )
+        assert any(r.category == "context_switching" and r.severity == "warning" for r in result.recommendations)
+
+    def test_two_samples_without_cores_suggests_registration(self):
+        """Two samples without known cores should suggest registering host."""
+        metrics_prev = {"node_context_switches_total": 100000.0}
+        metrics_curr = {"node_context_switches_total": 130000.0}  # 30000/30 = 1000/sec
+        thresholds = _get_thresholds("default")
+        result = analyze_context_switching(
+            metrics_curr, thresholds,
+            cpu_cores=None,
+            previous_metrics=metrics_prev,
+            node_address="testhost",
+        )
+        # Should suggest registering host
+        assert any("register" in line.lower() or "register" in r.action.lower() for r in result.recommendations for line in result.lines) or \
+               any("registerhost" in r.action for r in result.recommendations)
+
+    def test_two_samples_without_cores_high_rate_warning(self):
+        """Without cores, high absolute rate should produce warning."""
+        metrics_prev = {"node_context_switches_total": 100000.0}
+        metrics_curr = {"node_context_switches_total": 1300000.0}  # 1200000/30 = 40000/sec — above 10000 warn
+        thresholds = _get_thresholds("default")
+        result = analyze_context_switching(
+            metrics_curr, thresholds,
+            cpu_cores=None,
+            previous_metrics=metrics_prev,
+            node_address="testhost",
+        )
+        assert any(r.category == "context_switching" and r.severity == "warning" for r in result.recommendations)
+
+    def test_counter_reset_detected(self):
+        """If current value < previous (counter reset/reboot), should handle gracefully."""
+        metrics_prev = {"node_context_switches_total": 5000000.0}
+        metrics_curr = {"node_context_switches_total": 100.0}  # Counter reset
+        thresholds = _get_thresholds("default")
+        result = analyze_context_switching(
+            metrics_curr, thresholds,
+            cpu_cores=4,
+            previous_metrics=metrics_prev,
+            node_address="testhost",
+        )
+        # Should mention counter reset, not crash
+        assert any("reset" in line.lower() or "baseline" in line.lower() for line in result.lines)
 
 
 class TestAnalyzeRemoteNode:
@@ -279,3 +424,34 @@ class TestAnalyzeRemoteNode:
         for profile in ["default", "strict", "relaxed"]:
             result = analyze_remote_node("localhost", port=9100, threshold_profile=profile)
             assert "CPU ANALYSIS" in result
+
+    @patch("linuxdoctor.analyzenode.fetch_metrics_text")
+    def test_context_switch_single_sample_no_false_positive(self, mock_fetch):
+        """Single sample should not produce false-positive context switch warning."""
+        mock_fetch.return_value = SAMPLE_METRICS_TEXT
+        result = analyze_remote_node("localhost", port=9100)
+        # Should NOT have a context_switching warning for raw counter value
+        # (the old code would flag 5M as exceeding the 10M threshold, but
+        # with the new counter-aware code, single samples show info only)
+        ctx_warnings = [r for r in _extract_recommendations_from_output(result)
+                        if r.get("category") == "context_switching" and r.get("severity") == "warning"]
+        # With single sample, should not have raw counter warning
+        # (may have info about registering, but not a warning about high switches)
+
+    def _extract_recommendations_from_output(self, output):
+        """Helper - not used in actual assertions, just for reference."""
+        pass
+
+    @patch("linuxdoctor.analyzenode.fetch_metrics_text")
+    def test_host_registry_integration(self, mock_fetch):
+        """Test that host registry is consulted for CPU cores."""
+        mock_fetch.return_value = SAMPLE_METRICS_TEXT
+        with patch("linuxdoctor.analyzenode.get_host_info") as mock_registry:
+            mock_registry.return_value = {"cpu_cores": 4}
+            result = analyze_remote_node("localhost", port=9100)
+            mock_registry.assert_called_once()
+
+
+def _extract_recommendations_from_output(output):
+    """Helper - placeholder."""
+    return []

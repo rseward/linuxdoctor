@@ -178,3 +178,41 @@ Without computing `rate()` or taking deltas, ANY threshold comparison on these m
 - StackOverflow: "What is rate node_context_switches_total" — confirms it's a counter requiring `rate()`
 - Node-doctor (SupportTools/node-doctor) — uses `sustainedHighLoadChecks` pattern to prevent false positives
 - BestHub: "Master Linux Host Monitoring" — comprehensive threshold reference
+
+## Implementation Status
+
+These recommendations were incorporated into linuxdoctor v0.2.0 via the following changes:
+
+### Counter-Aware Analysis (analyzenode.py)
+
+- **Context switches**: `node_context_switches_total` is now treated as a cumulative counter. Two-sample rate computation is supported via `--resample` flag. Per-core normalization is applied when CPU core count is known (from host registry or node_exporter metrics). Thresholds changed from raw counts to per-core-per-second rates.
+- **Disk I/O time**: `node_disk_io_time_seconds_total` is now treated as a cumulative counter. Two-sample rate computation computes utilization percentage. Single samples show an info notice instead of false-positive warnings.
+- **CPU iowait**: Already handled correctly via percentage-of-total approach (both numerator and denominator are cumulative counters with the same time base).
+
+### Host Registry (host_registry.py + CLI)
+
+New `registerhost` command allows storing host metadata (CPU cores, CPU sockets, description) in `~/.config/linuxdoctor/hosts.yaml`. This data is used by `analyzenode` to:
+- Normalize context switch metrics per CPU core
+- Provide more accurate threshold comparisons
+- Suggest registration when analysis detects unknown core counts
+
+Commands:
+- `linuxdoctor registerhost HOST --cpu-cores N [--cpu-sockets N] [--description DESC]`
+- `linuxdoctor list-registered`
+- `linuxdoctor unregisterhost HOST`
+
+### New Threshold Profiles
+
+Updated threshold profiles with counter-aware values:
+
+| Metric | Default Warning | Default Critical | Unit |
+|--------|----------------|-----------------|------|
+| Context switches (per core) | 1,000 | 5,000 | switches/core/sec |
+| Context switches (total) | 10,000 | - | switches/sec |
+| Disk I/O utilization | 70% | 90% | % busy |
+| CPU iowait | 20% | - | % of CPU time |
+
+### New CLI Flags
+
+- `--resample`: Take two samples 30s apart for rate-based counter analysis
+- `--resample-interval SECONDS`: Custom interval between samples

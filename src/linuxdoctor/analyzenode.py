@@ -5,6 +5,21 @@ their Prometheus node_exporter /metrics endpoint. It covers CPU, memory,
 disk, disk I/O, network, and context switching metrics with per-resource
 breakdowns and threshold-based recommendations.
 
+IMPORTANT: Many node_exporter metrics are cumulative counters (monotonically
+increasing since boot), not instantaneous gauges. This includes:
+  - node_cpu_seconds_total (counter)
+  - node_context_switches_total (counter)
+  - node_disk_io_time_seconds_total (counter)
+
+Comparing these raw values against static thresholds produces false positives
+on long-running systems. This module handles counters in two ways:
+  1. For CPU iowait: the percentage-of-total approach (iowait/total) is valid
+     because both numerator and denominator are cumulative counters with the
+     same time base.
+  2. For context switches and disk I/O time: we take two samples spaced
+     apart and compute rates, falling back to a warning if only one sample
+     is available.
+
 The analysis functions return structured AnalysisResult objects, keeping
 data gathering separate from presentation. Formatting is handled by
 _format_human() and _format_json().
@@ -12,11 +27,15 @@ _format_human() and _format_json().
 
 import json
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 import httpx
+
+from linuxdoctor.host_registry import get_host_info, DEFAULT_REGISTRY_PATH
 
 
 # ---------------------------------------------------------------------------
@@ -52,16 +71,28 @@ class AnalysisResult:
 # ---------------------------------------------------------------------------
 # Threshold profiles
 # ---------------------------------------------------------------------------
+# Context switch thresholds are now expressed as rates (per second) and
+# per-core rates (per core per second) rather than raw cumulative counts.
+# Disk I/O time thresholds are now expressed as percentages (utilization)
+# rather than cumulative seconds.
+#
+# Two-pass sampling is used for counter metrics: we take two samples
+# spaced RESAMPLE_INTERVAL_SECONDS apart and compute the rate between them.
+
+RESAMPLE_INTERVAL_SECONDS = 30  # Time between two counter samples
 
 THRESHOLDS = {
     "default": {
         "cpu_idle_warn_pct": 20,
-        "cpu_iowait_warn_pct": 20,
+        "cpu_iowait_warn_pct": 20,        # % of CPU time in iowait (percentage-of-total)
         "mem_used_warn_pct": 85,
         "disk_used_warn_pct": 85,
         "disk_used_critical_pct": 95,
-        "disk_io_time_warn_seconds": 10000,
-        "context_switches_warn_count": 10000000,
+        "disk_io_util_warn_pct": 70,       # disk I/O utilization % (rate-based)
+        "disk_io_util_critical_pct": 90,    # disk I/O utilization % critical
+        "context_switches_per_core_warn": 1000,   # switches/core/sec warning
+        "context_switches_per_core_critical": 5000, # switches/core/sec critical
+        "context_switches_total_warn": 10000,      # total switches/sec absolute warning
     },
     "strict": {
         "cpu_idle_warn_pct": 30,
@@ -69,8 +100,11 @@ THRESHOLDS = {
         "mem_used_warn_pct": 75,
         "disk_used_warn_pct": 70,
         "disk_used_critical_pct": 85,
-        "disk_io_time_warn_seconds": 5000,
-        "context_switches_warn_count": 5000000,
+        "disk_io_util_warn_pct": 50,
+        "disk_io_util_critical_pct": 70,
+        "context_switches_per_core_warn": 500,
+        "context_switches_per_core_critical": 2000,
+        "context_switches_total_warn": 5000,
     },
     "relaxed": {
         "cpu_idle_warn_pct": 10,
@@ -78,8 +112,11 @@ THRESHOLDS = {
         "mem_used_warn_pct": 95,
         "disk_used_warn_pct": 90,
         "disk_used_critical_pct": 98,
-        "disk_io_time_warn_seconds": 20000,
-        "context_switches_warn_count": 20000000,
+        "disk_io_util_warn_pct": 85,
+        "disk_io_util_critical_pct": 95,
+        "context_switches_per_core_warn": 2000,
+        "context_switches_per_core_critical": 10000,
+        "context_switches_total_warn": 20000,
     },
 }
 
@@ -87,6 +124,15 @@ THRESHOLDS = {
 def _get_thresholds(profile: str) -> dict:
     """Get threshold values for a given profile."""
     return THRESHOLDS.get(profile, THRESHOLDS["default"])
+
+
+def click_echo_safe(msg: str) -> None:
+    """Print a message to stderr (for verbose output during analysis)."""
+    try:
+        import click
+        click.echo(msg, err=True)
+    except Exception:
+        print(msg, file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -391,8 +437,14 @@ def analyze_disk(metrics: dict, thresholds: dict) -> AnalysisResult:
     return result
 
 
-def analyze_disk_io(metrics: dict, thresholds: dict) -> AnalysisResult:
-    """Analyze disk I/O and provide recommendations."""
+def analyze_disk_io(metrics: dict, thresholds: dict, previous_metrics: dict = None) -> AnalysisResult:
+    """Analyze disk I/O and provide recommendations.
+
+    node_disk_io_time_seconds_total is a cumulative counter, so comparing its
+    raw value to a threshold is meaningless on a long-running system. We
+    compute a utilization rate when two samples are available, or show an
+    info notice when only a single sample is present.
+    """
     result = AnalysisResult(category="disk_io")
     recommendations = []
     lines = result.lines
@@ -402,24 +454,62 @@ def analyze_disk_io(metrics: dict, thresholds: dict) -> AnalysisResult:
     lines.append("DISK I/O ANALYSIS")
     lines.append("=" * 50)
 
-    io_warn = thresholds["disk_io_time_warn_seconds"]
+    io_warn_pct = thresholds["disk_io_util_warn_pct"]
+    io_critical_pct = thresholds["disk_io_util_critical_pct"]
 
     io_time = metrics.get("node_disk_io_time_seconds_total", [])
     if not io_time:
         lines.append("❌ Disk I/O metrics not found.")
         return result
 
+    # Try to compute rate if we have previous metrics
+    previous_io_time = None
+    if previous_metrics:
+        previous_io_time = previous_metrics.get("node_disk_io_time_seconds_total", [])
+
     for entry in io_time:
-        if "device" in entry["labels"]:
-            device = entry["labels"]["device"]
-            io_status = "✅" if entry["value"] <= io_warn else "⚠️"
-            lines.append(f"{io_status} Device {device}: I/O time {entry['value']:.0f}s [warning above {io_warn}s]")
-            if entry["value"] > io_warn:
-                recommendations.append(Recommendation(
-                    category="disk_io", severity="warning",
-                    message=f"Device {device} I/O time is {entry['value']:.0f}s, above the {io_warn}s warning threshold. This could be a bottleneck.",
-                    action="Check I/O queue: `iostat -x 1 5` and `iotop`."
-                ))
+        if "device" not in entry["labels"]:
+            continue
+        device = entry["labels"]["device"]
+        current_val = entry["value"]
+
+        if previous_io_time:
+            # Find matching device in previous sample
+            prev_val = None
+            for prev_entry in previous_io_time:
+                if prev_entry.get("labels", {}).get("device") == device:
+                    prev_val = prev_entry["value"]
+                    break
+
+            if prev_val is not None and current_val >= prev_val:
+                delta = current_val - prev_val
+                interval = RESAMPLE_INTERVAL_SECONDS
+                util_pct = (delta / interval) * 100
+                lines.append(f"  Device {device}: I/O utilization {util_pct:.1f}% (rate over {interval}s)")
+
+                if util_pct >= io_critical_pct:
+                    lines.append(f"  🔴 Device {device}: I/O utilization {util_pct:.1f}% [critical above {io_critical_pct}%]")
+                    recommendations.append(Recommendation(
+                        category="disk_io", severity="critical",
+                        message=f"Device {device} I/O utilization is {util_pct:.1f}%, above the {io_critical_pct}% critical threshold.",
+                        action="Check I/O queue: `iostat -x 1 5` and `iotop`. Consider faster storage or workload distribution."
+                    ))
+                elif util_pct >= io_warn_pct:
+                    lines.append(f"  ⚠️ Device {device}: I/O utilization {util_pct:.1f}% [warning above {io_warn_pct}%]")
+                    recommendations.append(Recommendation(
+                        category="disk_io", severity="warning",
+                        message=f"Device {device} I/O utilization is {util_pct:.1f}%, above the {io_warn_pct}% warning threshold.",
+                        action="Check I/O queue: `iostat -x 1 5` and `iotop`."
+                    ))
+                else:
+                    lines.append(f"  ✅ Device {device}: I/O utilization {util_pct:.1f}% [warning above {io_warn_pct}%]")
+            else:
+                # Counter may have reset (reboot) or no match
+                lines.append(f"  ℹ️  Device {device}: cumulative I/O time {current_val:.0f}s (insufficient data for rate — counter may have reset)")
+        else:
+            # Only one sample available — raw counter value is not meaningful for threshold comparison
+            lines.append(f"  ℹ️  Device {device}: cumulative I/O time {current_val:.0f}s (raw counter, not a rate)")
+            lines.append(f"  💡 Tip: Two-sample analysis needed for rate-based I/O thresholds. Consider using --resample flag.")
 
     result.recommendations = recommendations
     return result
@@ -478,8 +568,20 @@ def analyze_network(metrics: dict, thresholds: dict) -> AnalysisResult:
     return result
 
 
-def analyze_context_switching(metrics: dict, thresholds: dict) -> AnalysisResult:
-    """Analyze context switching and provide recommendations."""
+def analyze_context_switching(
+    metrics: dict, thresholds: dict, cpu_cores: Optional[int] = None,
+    previous_metrics: dict = None, node_address: str = "",
+) -> AnalysisResult:
+    """Analyze context switching and provide recommendations.
+
+    node_context_switches_total is a cumulative counter since boot. Comparing
+    its raw value to a threshold is meaningless on long-running systems.
+
+    We compute a per-second rate when two samples are available, then
+    normalize by CPU core count if known. When the core count is unknown, we
+    fall back to absolute rate thresholds and suggest the user register the
+    host with `linuxdoctor registerhost`.
+    """
     result = AnalysisResult(category="context_switching")
     recommendations = []
     lines = result.lines
@@ -489,22 +591,75 @@ def analyze_context_switching(metrics: dict, thresholds: dict) -> AnalysisResult
     lines.append("CONTEXT SWITCHING ANALYSIS")
     lines.append("=" * 50)
 
-    cs_warn = thresholds["context_switches_warn_count"]
+    cs_per_core_warn = thresholds["context_switches_per_core_warn"]
+    cs_per_core_critical = thresholds["context_switches_per_core_critical"]
+    cs_total_warn = thresholds["context_switches_total_warn"]
 
     context_switches = metrics.get("node_context_switches_total")
     if context_switches is None:
         lines.append("❌ Context switching metrics not found.")
         return result
 
-    cs_status = "✅" if context_switches <= cs_warn else "⚠️"
-    lines.append(f"{cs_status} Total Context Switches: {context_switches:,} [warning above {cs_warn:,}]")
+    # Try rate computation from two samples
+    previous_cs = None
+    if previous_metrics:
+        previous_cs = previous_metrics.get("node_context_switches_total")
 
-    if context_switches > cs_warn:
-        recommendations.append(Recommendation(
-            category="context_switching", severity="warning",
-            message=f"Context switches ({context_switches:,}) exceed the {cs_warn:,} warning threshold. This could indicate that the system is thrashing.",
-            action="Review process count and scheduling: `vmstat 1 5` and `ps -ef | wc -l`."
-        ))
+    if previous_cs is not None and context_switches >= previous_cs:
+        # We have two samples — compute the rate
+        delta = context_switches - previous_cs
+        interval = RESAMPLE_INTERVAL_SECONDS
+        rate_per_sec = delta / interval
+
+        lines.append(f"  Context switch rate: {rate_per_sec:,.0f} switches/sec (over {interval}s window)")
+
+        if cpu_cores and cpu_cores > 0:
+            per_core = rate_per_sec / cpu_cores
+            lines.append(f"  CPU cores: {cpu_cores} (from host registry)")
+            lines.append(f"  Per-core rate: {per_core:,.0f} switches/core/sec")
+
+            if per_core >= cs_per_core_critical:
+                lines.append(f"  🔴 Per-core rate {per_core:,.0f}/core/sec [critical above {cs_per_core_critical}/core/sec]")
+                recommendations.append(Recommendation(
+                    category="context_switching", severity="critical",
+                    message=f"Context switch rate is {per_core:,.0f} per core per second (critical threshold: {cs_per_core_critical}/core/sec). This indicates severe scheduling issues.",
+                    action="Review process count and scheduling: `vmstat 1 5` and `ps -ef | wc -l`."
+                ))
+            elif per_core >= cs_per_core_warn:
+                lines.append(f"  ⚠️ Per-core rate {per_core:,.0f}/core/sec [warning above {cs_per_core_warn}/core/sec]")
+                recommendations.append(Recommendation(
+                    category="context_switching", severity="warning",
+                    message=f"Context switch rate is {per_core:,.0f} per core per second (warning threshold: {cs_per_core_warn}/core/sec). This could indicate contention.",
+                    action="Review process count and scheduling: `vmstat 1 5` and `ps -ef | wc -l`."
+                ))
+            else:
+                lines.append(f"  ✅ Per-core rate {per_core:,.0f}/core/sec [warning above {cs_per_core_warn}/core/sec]")
+        else:
+            # No core count — use absolute thresholds
+            lines.append(f"  ⚠️  CPU core count unknown — using absolute thresholds (less accurate)")
+            if rate_per_sec >= cs_total_warn:
+                lines.append(f"  ⚠️ Total rate {rate_per_sec:,.0f}/sec [warning above {cs_total_warn}/sec]")
+                recommendations.append(Recommendation(
+                    category="context_switching", severity="warning",
+                    message=f"Context switch rate is {rate_per_sec:,.0f}/sec (absolute warning threshold: {cs_total_warn}/sec). Accuracy improves with known CPU core count.",
+                    action="Register this host's CPU core count for better accuracy: `linuxdoctor registerhost {node_address} --cpu-cores N`"
+                ))
+            else:
+                lines.append(f"  ✅ Total rate {rate_per_sec:,.0f}/sec [warning above {cs_total_warn}/sec]")
+                # Even when healthy, suggest registration if cores are unknown
+                recommendations.append(Recommendation(
+                    category="context_switching", severity="info",
+                    message=f"CPU core count is not registered for {node_address}. Context switch analysis is more accurate when normalized per core.",
+                    action=f"Register: `linuxdoctor registerhost {node_address} --cpu-cores N`"
+                ))
+    elif previous_cs is not None and context_switches < previous_cs:
+        # Counter reset (reboot)
+        lines.append(f"  ℹ️  Counter may have reset (current: {context_switches:,}, previous: {previous_cs:,}). Using current value as baseline.")
+    else:
+        # Only one sample — can't compute rate
+        lines.append(f"  ℹ️  Cumulative context switches: {context_switches:,} (raw counter since boot)")
+        lines.append(f"  💡 Two-sample analysis needed for rate-based thresholds. Consider using --resample flag.")
+        lines.append(f"  💡 Register CPU cores for better accuracy: `linuxdoctor registerhost {node_address} --cpu-cores N`")
 
     result.recommendations = recommendations
     return result
@@ -520,7 +675,9 @@ def _severity_icon(severity: str) -> str:
 
 
 def _format_human(url: str, results: list[AnalysisResult],
-                  include_recommendations: bool = True) -> str:
+                  include_recommendations: bool = True,
+                  node_address: str = "",
+                  cpu_cores: Optional[int] = None) -> str:
     """Format analysis results for human-readable output.
 
     Separates data gathering from presentation, preserving the clean
@@ -563,7 +720,8 @@ def _format_human(url: str, results: list[AnalysisResult],
 
 def _format_json(url: str, port: int, metrics: dict,
                  results: list[AnalysisResult],
-                 include_recommendations: bool = True) -> str:
+                 include_recommendations: bool = True,
+                 cpu_cores: Optional[int] = None) -> str:
     """Format results as JSON."""
     all_recommendations = []
     for r in results:
@@ -583,6 +741,7 @@ def _format_json(url: str, port: int, metrics: dict,
         "node": url,
         "port": port,
         "timestamp": datetime.now().isoformat(),
+        "cpu_cores_registered": cpu_cores,
         "metrics": {
             "cpu": {
                 "count": num_cpus,
@@ -633,6 +792,9 @@ def analyze_remote_node(
     include_recommendations: bool = True,
     threshold_profile: str = "default",
     verbose: bool = False,
+    resample: bool = False,
+    resample_interval: int = None,
+    registry_path: str = DEFAULT_REGISTRY_PATH,
 ) -> str:
     """Analyze a remote node using node_exporter metrics.
 
@@ -643,12 +805,24 @@ def analyze_remote_node(
         include_recommendations: If True, generate recommendations.
         threshold_profile: Threshold profile: default, strict, or relaxed.
         verbose: If True, show detailed metric output.
+        resample: If True, take two samples spaced apart to compute rates for counter metrics.
+        resample_interval: Seconds between samples (default: RESAMPLE_INTERVAL_SECONDS).
+        registry_path: Path to the host registry YAML file.
 
     Returns:
         Formatted analysis string.
     """
     url = f"http://{node_address}:{port}/metrics"
     thresholds = _get_thresholds(threshold_profile)
+
+    # Look up host metadata from registry
+    host_info = get_host_info(node_address, path=registry_path)
+    cpu_cores = host_info.get("cpu_cores") if host_info else None
+
+    if verbose and host_info:
+        click_echo_safe(f"📋 Host registry: {node_address} -> {host_info}")
+    elif verbose and not host_info:
+        click_echo_safe(f"📋 Host registry: {node_address} not registered. Use `linuxdoctor registerhost` for better context switch analysis.")
 
     try:
         metrics_text = fetch_metrics_text(node_address, port)
@@ -658,20 +832,49 @@ def analyze_remote_node(
             return json.dumps({"error": str(e), "node": node_address}, indent=2)
         return f"Error: {e}"
 
+    # Try to determine CPU cores from metrics if not in registry
+    if cpu_cores is None:
+        cpu_seconds = metrics.get("node_cpu_seconds_total", [])
+        if cpu_seconds:
+            # node_exporter exposes per-cpu metrics, so distinct cpu labels = logical CPUs
+            cpu_cores = len(set(
+                e["labels"]["cpu"] for e in cpu_seconds if "cpu" in e["labels"]
+            ))
+            # Note: this is logical CPUs (including HT), not physical cores.
+            # The registry can provide a more accurate physical core count.
+
+    # Optional second sample for rate-based analysis of counters
+    previous_metrics = None
+    if resample:
+        interval = resample_interval or RESAMPLE_INTERVAL_SECONDS
+        time.sleep(interval)
+        try:
+            metrics_text_2 = fetch_metrics_text(node_address, port)
+            previous_metrics = metrics  # first sample becomes "previous"
+            metrics = parse_metrics(metrics_text_2)  # second sample is "current"
+        except RuntimeError as e:
+            # If second sample fails, proceed with single-sample analysis
+            pass
+
     # Run all analysis functions
     results = [
         analyze_cpu(metrics, thresholds),
         analyze_memory(metrics, thresholds),
         analyze_disk(metrics, thresholds),
-        analyze_disk_io(metrics, thresholds),
+        analyze_disk_io(metrics, thresholds, previous_metrics=previous_metrics),
         analyze_network(metrics, thresholds),
-        analyze_context_switching(metrics, thresholds),
+        analyze_context_switching(
+            metrics, thresholds,
+            cpu_cores=cpu_cores,
+            previous_metrics=previous_metrics,
+            node_address=node_address,
+        ),
     ]
 
     if json_output:
-        return _format_json(url, port, metrics, results, include_recommendations)
+        return _format_json(url, port, metrics, results, include_recommendations, cpu_cores=cpu_cores)
 
-    return _format_human(url, results, include_recommendations)
+    return _format_human(url, results, include_recommendations, node_address=node_address, cpu_cores=cpu_cores)
 
 
 def fetch_metrics_text(node_address: str, port: int = 9100, timeout: int = 10) -> str:
