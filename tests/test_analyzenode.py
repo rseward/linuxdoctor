@@ -15,6 +15,7 @@ from linuxdoctor.analyzenode import (
     _get_thresholds,
     NodeMetric,
     Recommendation,
+    AnalysisResult,
 )
 
 
@@ -112,9 +113,11 @@ class TestAnalyzeCpu:
             "node_load15": 0.3,
         }
         thresholds = _get_thresholds("default")
-        recs, lines = analyze_cpu(metrics, thresholds)
-        assert len(recs) == 0
-        assert any("CPU ANALYSIS" in line for line in lines)
+        result = analyze_cpu(metrics, thresholds)
+        assert isinstance(result, AnalysisResult)
+        assert result.category == "cpu"
+        assert len(result.recommendations) == 0
+        assert any("CPU ANALYSIS" in line for line in result.lines)
 
     def test_low_idle_cpu(self):
         metrics = {
@@ -128,16 +131,17 @@ class TestAnalyzeCpu:
             "node_load15": 3.0,
         }
         thresholds = _get_thresholds("default")
-        recs, lines = analyze_cpu(metrics, thresholds)
-        # Should warn about low idle and high load
-        assert any(r.category == "cpu" for r in recs)
+        result = analyze_cpu(metrics, thresholds)
+        assert isinstance(result, AnalysisResult)
+        assert any(r.category == "cpu" for r in result.recommendations)
 
     def test_no_cpu_metrics(self):
         metrics = {}
         thresholds = _get_thresholds("default")
-        recs, lines = analyze_cpu(metrics, thresholds)
-        assert len(recs) == 0
-        assert any("not found" in line for line in lines)
+        result = analyze_cpu(metrics, thresholds)
+        assert isinstance(result, AnalysisResult)
+        assert len(result.recommendations) == 0
+        assert any("not found" in line for line in result.lines)
 
 
 class TestAnalyzeMemory:
@@ -149,8 +153,9 @@ class TestAnalyzeMemory:
             "node_memory_MemAvailable_bytes": 10e9,
         }
         thresholds = _get_thresholds("default")
-        recs, lines = analyze_memory(metrics, thresholds)
-        assert len(recs) == 0
+        result = analyze_memory(metrics, thresholds)
+        assert isinstance(result, AnalysisResult)
+        assert len(result.recommendations) == 0
 
     def test_high_memory_usage(self):
         metrics = {
@@ -158,15 +163,17 @@ class TestAnalyzeMemory:
             "node_memory_MemAvailable_bytes": 1e9,  # ~94% used
         }
         thresholds = _get_thresholds("default")
-        recs, lines = analyze_memory(metrics, thresholds)
-        assert len(recs) >= 1
-        assert recs[0].category == "memory"
+        result = analyze_memory(metrics, thresholds)
+        assert isinstance(result, AnalysisResult)
+        assert len(result.recommendations) >= 1
+        assert result.recommendations[0].category == "memory"
 
     def test_no_memory_metrics(self):
         metrics = {}
         thresholds = _get_thresholds("default")
-        recs, lines = analyze_memory(metrics, thresholds)
-        assert any("not found" in line for line in lines)
+        result = analyze_memory(metrics, thresholds)
+        assert isinstance(result, AnalysisResult)
+        assert any("not found" in line for line in result.lines)
 
 
 class TestAnalyzeDisk:
@@ -182,8 +189,9 @@ class TestAnalyzeDisk:
             ],
         }
         thresholds = _get_thresholds("default")
-        recs, lines = analyze_disk(metrics, thresholds)
-        assert len(recs) == 0
+        result = analyze_disk(metrics, thresholds)
+        assert isinstance(result, AnalysisResult)
+        assert len(result.recommendations) == 0
 
     def test_critical_disk_usage(self):
         metrics = {
@@ -195,15 +203,17 @@ class TestAnalyzeDisk:
             ],
         }
         thresholds = _get_thresholds("default")
-        recs, lines = analyze_disk(metrics, thresholds)
-        assert len(recs) >= 1
-        assert recs[0].severity == "critical"
+        result = analyze_disk(metrics, thresholds)
+        assert isinstance(result, AnalysisResult)
+        assert len(result.recommendations) >= 1
+        assert result.recommendations[0].severity == "critical"
 
     def test_no_disk_metrics(self):
         metrics = {}
         thresholds = _get_thresholds("default")
-        recs, lines = analyze_disk(metrics, thresholds)
-        assert any("not found" in line for line in lines)
+        result = analyze_disk(metrics, thresholds)
+        assert isinstance(result, AnalysisResult)
+        assert any("not found" in line for line in result.lines)
 
 
 class TestAnalyzeContextSwitching:
@@ -212,21 +222,24 @@ class TestAnalyzeContextSwitching:
     def test_normal_context_switches(self):
         metrics = {"node_context_switches_total": 1000.0}
         thresholds = _get_thresholds("default")
-        recs, lines = analyze_context_switching(metrics, thresholds)
-        assert len(recs) == 0
+        result = analyze_context_switching(metrics, thresholds)
+        assert isinstance(result, AnalysisResult)
+        assert len(result.recommendations) == 0
 
     def test_high_context_switches(self):
         metrics = {"node_context_switches_total": 50000000.0}
         thresholds = _get_thresholds("default")
-        recs, lines = analyze_context_switching(metrics, thresholds)
-        assert len(recs) >= 1
-        assert recs[0].category == "context_switching"
+        result = analyze_context_switching(metrics, thresholds)
+        assert isinstance(result, AnalysisResult)
+        assert len(result.recommendations) >= 1
+        assert result.recommendations[0].category == "context_switching"
 
     def test_missing_context_switches(self):
         metrics = {}
         thresholds = _get_thresholds("default")
-        recs, lines = analyze_context_switching(metrics, thresholds)
-        assert any("not found" in line for line in lines)
+        result = analyze_context_switching(metrics, thresholds)
+        assert isinstance(result, AnalysisResult)
+        assert any("not found" in line for line in result.lines)
 
 
 class TestAnalyzeRemoteNode:
@@ -253,7 +266,6 @@ class TestAnalyzeRemoteNode:
         mock_fetch.return_value = SAMPLE_METRICS_TEXT
         result = analyze_remote_node("localhost", port=9100, include_recommendations=False)
         # When recommendations are disabled, the summary section should show healthy
-        # (individual analysis sections still appear, but no recommendation details)
         assert "⚠️  RECOMMENDATIONS" not in result
 
     def test_connection_failure(self):

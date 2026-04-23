@@ -68,6 +68,8 @@ src/linuxdoctor/
 ├── cli.py               # Click CLI entry point
 ├── analyze.py            # Local host analysis (sar, vmstat, etc.)
 ├── analyzenode.py        # Remote node analysis (node_exporter)
+│                        #   Analysis functions return AnalysisResult objects
+│                        #   Formatting separated into _format_human/_format_json
 ├── collectors.py         # Local metric collectors
 ├── recommendations.py    # Local recommendation engine
 ├── prometheus.py         # Prometheus host discovery

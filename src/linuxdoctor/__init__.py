@@ -3,7 +3,7 @@
 __version__ = "0.1.0"
 
 from linuxdoctor.analyze import analyze_host
-from linuxdoctor.analyzenode import analyze_remote_node
+from linuxdoctor.analyzenode import analyze_remote_node, AnalysisResult
 from linuxdoctor.prometheus import list_hosts_from_prometheus
 
-__all__ = ["analyze_host", "analyze_remote_node", "list_hosts_from_prometheus"]
+__all__ = ["analyze_host", "analyze_remote_node", "list_hosts_from_prometheus", "AnalysisResult"]

@@ -4,6 +4,10 @@ This module provides detailed analysis of remote Linux hosts by querying
 their Prometheus node_exporter /metrics endpoint. It covers CPU, memory,
 disk, disk I/O, network, and context switching metrics with per-resource
 breakdowns and threshold-based recommendations.
+
+The analysis functions return structured AnalysisResult objects, keeping
+data gathering separate from presentation. Formatting is handled by
+_format_human() and _format_json().
 """
 
 import json
@@ -35,6 +39,14 @@ class Recommendation:
     message: str
     detail: str = ""
     action: str = ""
+
+
+@dataclass
+class AnalysisResult:
+    """Result from a single analysis category."""
+    category: str
+    lines: list[str] = field(default_factory=list)
+    recommendations: list[Recommendation] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -200,18 +212,15 @@ def _get_all_metrics(metrics: list[NodeMetric], name: str) -> list[NodeMetric]:
 
 
 # ---------------------------------------------------------------------------
-# Analysis functions
+# Analysis functions — return AnalysisResult, not formatted text
 # ---------------------------------------------------------------------------
 
-def _severity_icon(severity: str) -> str:
-    """Return an icon for severity level."""
-    return {"critical": "🔴", "warning": "🟡", "info": "🔵"}.get(severity, "⚪")
-
-
-def analyze_cpu(metrics: dict, thresholds: dict) -> list[Recommendation]:
+def analyze_cpu(metrics: dict, thresholds: dict) -> AnalysisResult:
     """Analyze CPU usage and provide recommendations."""
+    result = AnalysisResult(category="cpu")
     recommendations = []
-    lines = []
+    lines = result.lines
+
     lines.append("")
     lines.append("=" * 50)
     lines.append("CPU ANALYSIS")
@@ -223,7 +232,7 @@ def analyze_cpu(metrics: dict, thresholds: dict) -> list[Recommendation]:
     cpu_seconds = metrics.get("node_cpu_seconds_total", [])
     if not cpu_seconds:
         lines.append("❌ CPU metrics not found.")
-        return recommendations, lines
+        return result
 
     num_cpus = len(set(
         entry["labels"]["cpu"] for entry in cpu_seconds if "cpu" in entry["labels"]
@@ -279,13 +288,16 @@ def analyze_cpu(metrics: dict, thresholds: dict) -> list[Recommendation]:
             action="Review running processes with `ps aux --sort=-%cpu | head -20`."
         ))
 
-    return recommendations, lines
+    result.recommendations = recommendations
+    return result
 
 
-def analyze_memory(metrics: dict, thresholds: dict) -> list[Recommendation]:
+def analyze_memory(metrics: dict, thresholds: dict) -> AnalysisResult:
     """Analyze memory usage and provide recommendations."""
+    result = AnalysisResult(category="memory")
     recommendations = []
-    lines = []
+    lines = result.lines
+
     lines.append("")
     lines.append("=" * 50)
     lines.append("MEMORY ANALYSIS")
@@ -317,13 +329,16 @@ def analyze_memory(metrics: dict, thresholds: dict) -> list[Recommendation]:
     else:
         lines.append("❌ Memory metrics not found.")
 
-    return recommendations, lines
+    result.recommendations = recommendations
+    return result
 
 
-def analyze_disk(metrics: dict, thresholds: dict) -> list[Recommendation]:
+def analyze_disk(metrics: dict, thresholds: dict) -> AnalysisResult:
     """Analyze disk usage and provide recommendations."""
+    result = AnalysisResult(category="disk")
     recommendations = []
-    lines = []
+    lines = result.lines
+
     lines.append("")
     lines.append("=" * 50)
     lines.append("DISK ANALYSIS")
@@ -337,7 +352,7 @@ def analyze_disk(metrics: dict, thresholds: dict) -> list[Recommendation]:
 
     if not disk_size_bytes:
         lines.append("❌ Disk metrics not found.")
-        return recommendations, lines
+        return result
 
     for size_entry in disk_size_bytes:
         if "mountpoint" in size_entry["labels"]:
@@ -372,13 +387,16 @@ def analyze_disk(metrics: dict, thresholds: dict) -> list[Recommendation]:
                             ))
                     break
 
-    return recommendations, lines
+    result.recommendations = recommendations
+    return result
 
 
-def analyze_disk_io(metrics: dict, thresholds: dict) -> list[Recommendation]:
+def analyze_disk_io(metrics: dict, thresholds: dict) -> AnalysisResult:
     """Analyze disk I/O and provide recommendations."""
+    result = AnalysisResult(category="disk_io")
     recommendations = []
-    lines = []
+    lines = result.lines
+
     lines.append("")
     lines.append("=" * 50)
     lines.append("DISK I/O ANALYSIS")
@@ -389,7 +407,7 @@ def analyze_disk_io(metrics: dict, thresholds: dict) -> list[Recommendation]:
     io_time = metrics.get("node_disk_io_time_seconds_total", [])
     if not io_time:
         lines.append("❌ Disk I/O metrics not found.")
-        return recommendations, lines
+        return result
 
     for entry in io_time:
         if "device" in entry["labels"]:
@@ -403,13 +421,16 @@ def analyze_disk_io(metrics: dict, thresholds: dict) -> list[Recommendation]:
                     action="Check I/O queue: `iostat -x 1 5` and `iotop`."
                 ))
 
-    return recommendations, lines
+    result.recommendations = recommendations
+    return result
 
 
-def analyze_network(metrics: dict, thresholds: dict) -> list[Recommendation]:
+def analyze_network(metrics: dict, thresholds: dict) -> AnalysisResult:
     """Analyze network usage and provide recommendations."""
+    result = AnalysisResult(category="network")
     recommendations = []
-    lines = []
+    lines = result.lines
+
     lines.append("")
     lines.append("=" * 50)
     lines.append("NETWORK ANALYSIS")
@@ -422,7 +443,7 @@ def analyze_network(metrics: dict, thresholds: dict) -> list[Recommendation]:
 
     if not receive_bytes:
         lines.append("❌ Network metrics not found.")
-        return recommendations, lines
+        return result
 
     for i, rx_entry in enumerate(receive_bytes):
         if "device" in rx_entry["labels"]:
@@ -453,13 +474,16 @@ def analyze_network(metrics: dict, thresholds: dict) -> list[Recommendation]:
             else:
                 lines.append(f"  ✅ No transmit errors")
 
-    return recommendations, lines
+    result.recommendations = recommendations
+    return result
 
 
-def analyze_context_switching(metrics: dict, thresholds: dict) -> list[Recommendation]:
+def analyze_context_switching(metrics: dict, thresholds: dict) -> AnalysisResult:
     """Analyze context switching and provide recommendations."""
+    result = AnalysisResult(category="context_switching")
     recommendations = []
-    lines = []
+    lines = result.lines
+
     lines.append("")
     lines.append("=" * 50)
     lines.append("CONTEXT SWITCHING ANALYSIS")
@@ -470,7 +494,7 @@ def analyze_context_switching(metrics: dict, thresholds: dict) -> list[Recommend
     context_switches = metrics.get("node_context_switches_total")
     if context_switches is None:
         lines.append("❌ Context switching metrics not found.")
-        return recommendations, lines
+        return result
 
     cs_status = "✅" if context_switches <= cs_warn else "⚠️"
     lines.append(f"{cs_status} Total Context Switches: {context_switches:,} [warning above {cs_warn:,}]")
@@ -482,22 +506,50 @@ def analyze_context_switching(metrics: dict, thresholds: dict) -> list[Recommend
             action="Review process count and scheduling: `vmstat 1 5` and `ps -ef | wc -l`."
         ))
 
-    return recommendations, lines
+    result.recommendations = recommendations
+    return result
 
 
 # ---------------------------------------------------------------------------
 # Formatting
 # ---------------------------------------------------------------------------
 
-def _format_recommendations(url: str, recommendations: list[Recommendation]) -> list[str]:
-    """Format the recommendations summary."""
+def _severity_icon(severity: str) -> str:
+    """Return an icon for severity level."""
+    return {"critical": "🔴", "warning": "🟡", "info": "🔵"}.get(severity, "⚪")
+
+
+def _format_human(url: str, results: list[AnalysisResult],
+                  include_recommendations: bool = True) -> str:
+    """Format analysis results for human-readable output.
+
+    Separates data gathering from presentation, preserving the clean
+    section-based layout from the original linuxdoctor.py.
+    """
+    all_recommendations = []
+    for r in results:
+        all_recommendations.extend(r.recommendations)
+
     lines = []
+    lines.append("🔍 Linux Doctor v0.1.0")
+    lines.append(f"📊 Analyzing prometheus node exporter at {url}")
+    lines.append("=" * 50)
+
+    # Emit each analysis section
+    for r in results:
+        lines.extend(r.lines)
+
+    # Sort recommendations by severity
+    severity_order = {"critical": 0, "warning": 1, "info": 2}
+    all_recommendations.sort(key=lambda r: severity_order.get(r.severity, 3))
+
+    # Recommendations summary
     lines.append("")
     lines.append("=" * 50)
-    if recommendations:
+    if include_recommendations and all_recommendations:
         lines.append(f"⚠️  RECOMMENDATIONS FOR {url}")
         lines.append("=" * 50)
-        for i, rec in enumerate(recommendations, 1):
+        for i, rec in enumerate(all_recommendations, 1):
             icon = _severity_icon(rec.severity)
             lines.append(f"{i}. {icon} [{rec.severity.upper()}] {rec.message}")
             if rec.action:
@@ -505,20 +557,17 @@ def _format_recommendations(url: str, recommendations: list[Recommendation]) -> 
     else:
         lines.append(f"✅ NO RECOMMENDATIONS - {url} LOOKS HEALTHY!")
     lines.append("=" * 50)
-    return lines
+
+    return "\n".join(lines)
 
 
 def _format_json(url: str, port: int, metrics: dict,
-                 recommendations: list[Recommendation],
-                 include_recommendations: bool) -> str:
+                 results: list[AnalysisResult],
+                 include_recommendations: bool = True) -> str:
     """Format results as JSON."""
-    output = {
-        "node": url,
-        "port": port,
-        "timestamp": datetime.now().isoformat(),
-        "metrics": {},
-        "recommendations": [],
-    }
+    all_recommendations = []
+    for r in results:
+        all_recommendations.extend(r.recommendations)
 
     # Extract key metrics for JSON output
     cpu_seconds = metrics.get("node_cpu_seconds_total", [])
@@ -530,31 +579,39 @@ def _format_json(url: str, port: int, metrics: dict,
     total_time = sum(e["value"] for e in cpu_seconds)
     iowait_time = sum(e["value"] for e in cpu_seconds if e.get("labels", {}).get("mode") == "iowait")
 
-    output["metrics"]["cpu"] = {
-        "count": num_cpus,
-        "idle_pct": round(idle_time / total_time * 100, 2) if total_time > 0 else None,
-        "iowait_pct": round(iowait_time / total_time * 100, 2) if total_time > 0 else None,
+    output = {
+        "node": url,
+        "port": port,
+        "timestamp": datetime.now().isoformat(),
+        "metrics": {
+            "cpu": {
+                "count": num_cpus,
+                "idle_pct": round(idle_time / total_time * 100, 2) if total_time > 0 else None,
+                "iowait_pct": round(iowait_time / total_time * 100, 2) if total_time > 0 else None,
+            },
+            "memory": {
+                "total_bytes": metrics.get("node_memory_MemTotal_bytes"),
+                "available_bytes": metrics.get("node_memory_MemAvailable_bytes"),
+            },
+            "load": {
+                "1m": metrics.get("node_load1", 0),
+                "5m": metrics.get("node_load5", 0),
+                "15m": metrics.get("node_load15", 0),
+            },
+        },
+        "recommendations": [],
     }
 
+    # Add memory used_pct
     mem_total = metrics.get("node_memory_MemTotal_bytes")
     mem_available = metrics.get("node_memory_MemAvailable_bytes")
-    output["metrics"]["memory"] = {
-        "total_bytes": mem_total,
-        "available_bytes": mem_available,
-        "used_pct": round((1 - mem_available / mem_total) * 100, 1) if mem_total and mem_available and mem_total > 0 else None,
-    }
-
-    load_1 = metrics.get("node_load1", 0)
-    load_5 = metrics.get("node_load5", 0)
-    load_15 = metrics.get("node_load15", 0)
-    output["metrics"]["load"] = {
-        "1m": load_1,
-        "5m": load_5,
-        "15m": load_15,
-    }
+    if mem_total and mem_available and mem_total > 0:
+        output["metrics"]["memory"]["used_pct"] = round((1 - mem_available / mem_total) * 100, 1)
+    else:
+        output["metrics"]["memory"]["used_pct"] = None
 
     if include_recommendations:
-        for rec in recommendations:
+        for rec in all_recommendations:
             output["recommendations"].append({
                 "severity": rec.severity,
                 "category": rec.category,
@@ -602,52 +659,19 @@ def analyze_remote_node(
         return f"Error: {e}"
 
     # Run all analysis functions
-    all_recommendations = []
-    all_lines = []
-
-    # Header
-    all_lines.append("🔍 Linux Doctor v0.1.0")
-    all_lines.append(f"📊 Analyzing prometheus node exporter at {url}")
-    all_lines.append("=" * 50)
-
-    cpu_recs, cpu_lines = analyze_cpu(metrics, thresholds)
-    all_recommendations.extend(cpu_recs)
-    all_lines.extend(cpu_lines)
-
-    mem_recs, mem_lines = analyze_memory(metrics, thresholds)
-    all_recommendations.extend(mem_recs)
-    all_lines.extend(mem_lines)
-
-    disk_recs, disk_lines = analyze_disk(metrics, thresholds)
-    all_recommendations.extend(disk_recs)
-    all_lines.extend(disk_lines)
-
-    io_recs, io_lines = analyze_disk_io(metrics, thresholds)
-    all_recommendations.extend(io_recs)
-    all_lines.extend(io_lines)
-
-    net_recs, net_lines = analyze_network(metrics, thresholds)
-    all_recommendations.extend(net_recs)
-    all_lines.extend(net_lines)
-
-    cs_recs, cs_lines = analyze_context_switching(metrics, thresholds)
-    all_recommendations.extend(cs_recs)
-    all_lines.extend(cs_lines)
-
-    # Sort by severity
-    severity_order = {"critical": 0, "warning": 1, "info": 2}
-    all_recommendations.sort(key=lambda r: severity_order.get(r.severity, 3))
+    results = [
+        analyze_cpu(metrics, thresholds),
+        analyze_memory(metrics, thresholds),
+        analyze_disk(metrics, thresholds),
+        analyze_disk_io(metrics, thresholds),
+        analyze_network(metrics, thresholds),
+        analyze_context_switching(metrics, thresholds),
+    ]
 
     if json_output:
-        return _format_json(url, port, metrics,
-                            all_recommendations if include_recommendations else [],
-                            include_recommendations)
+        return _format_json(url, port, metrics, results, include_recommendations)
 
-    # Recommendations summary
-    if include_recommendations:
-        all_lines.extend(_format_recommendations(url, all_recommendations))
-
-    return "\n".join(all_lines)
+    return _format_human(url, results, include_recommendations)
 
 
 def fetch_metrics_text(node_address: str, port: int = 9100, timeout: int = 10) -> str:
