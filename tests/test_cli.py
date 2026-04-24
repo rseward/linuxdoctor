@@ -91,6 +91,7 @@ class TestCli:
         result = runner.invoke(cli, ["registerhost", "--help"])
         assert result.exit_code == 0
         assert "--cpu-cores" in result.output
+        assert "--sshconnect" in result.output
         assert "HOST" in result.output
 
     def test_registerhost_command(self, tmp_path):
@@ -106,6 +107,7 @@ class TestCli:
         result = runner.invoke(cli, ["registerhost", "testhost"])
         assert result.exit_code == 1
         assert "No metadata" in result.output
+        assert "--sshconnect" in result.output
 
     def test_list_registered_empty(self, tmp_path):
         runner = CliRunner()
@@ -130,6 +132,32 @@ class TestCli:
         result = runner.invoke(cli, ["list-registered", "--registry", registry_path])
         assert result.exit_code == 0
         assert "myserver" in result.output
+
+    def test_registerhost_ssh_connect(self, tmp_path):
+        runner = CliRunner()
+        registry_path = str(tmp_path / "hosts.yaml")
+        result = runner.invoke(cli, ["registerhost", "remote1", "--sshconnect", "admin@remote1", "--cpu-cores", "4", "--registry", registry_path])
+        assert result.exit_code == 0
+        assert "Registered" in result.output
+        assert "ssh_connect" in result.output
+        assert "SSH" in result.output
+
+    def test_registerhost_ssh_only(self, tmp_path):
+        runner = CliRunner()
+        registry_path = str(tmp_path / "hosts.yaml")
+        result = runner.invoke(cli, ["registerhost", "remote2", "--sshconnect", "remote2", "--registry", registry_path])
+        assert result.exit_code == 0
+        assert "ssh_connect" in result.output
+
+    def test_register_and_list_ssh(self, tmp_path):
+        runner = CliRunner()
+        registry_path = str(tmp_path / "hosts.yaml")
+        result = runner.invoke(cli, ["registerhost", "remote1", "--sshconnect", "admin@remote1", "--cpu-cores", "8", "--registry", registry_path])
+        assert result.exit_code == 0
+        result = runner.invoke(cli, ["list-registered", "--registry", registry_path])
+        assert result.exit_code == 0
+        assert "remote1" in result.output
+        assert "SSH" in result.output
 
     def test_analyzenode_resample_option(self):
         runner = CliRunner()

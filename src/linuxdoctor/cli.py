@@ -135,8 +135,9 @@ def list_hosts(prometheus_url, timeout):
 @click.option("--cpu-cores", "cpu_cores", type=int, help="Number of CPU cores (logical processors)")
 @click.option("--cpu-sockets", "cpu_sockets", type=int, help="Number of physical CPU sockets")
 @click.option("--description", "-d", help="Human-readable description of the host")
+@click.option("--sshconnect", "ssh_connect", help="SSH connection string for metric collection (e.g. 'user@host'). Use this to collect metrics via SSH instead of node_exporter.")
 @click.option("--registry", "registry_path", default=None, help="Path to the host registry YAML file")
-def registerhost(host, cpu_cores, cpu_sockets, description, registry_path):
+def registerhost(host, cpu_cores, cpu_sockets, description, ssh_connect, registry_path):
     """Register host metadata for more accurate analysis.
 
     HOST is the hostname or IP address of the target node.
@@ -146,20 +147,28 @@ def registerhost(host, cpu_cores, cpu_sockets, description, registry_path):
     Without registered core count, context switch thresholds use less
     accurate absolute values.
 
+    Use --sshconnect to register a host for SSH-based metric collection
+    instead of node_exporter. The connection string should be in the format
+    'user@host' or just 'host' (which uses the current username). The user
+    must have passwordless SSH access and accepted host keys configured.
+
     Examples:
 
         linuxdoctor registerhost server1 --cpu-cores 8
         linuxdoctor registerhost 192.168.1.5 --cpu-cores 16 --cpu-sockets 2
         linuxdoctor registerhost db-main --cpu-cores 32 -d "Production DB server"
+        linuxdoctor registerhost remote1 --sshconnect admin@remote1 --cpu-cores 4
+        linuxdoctor registerhost remote2 --sshconnect remote2  # uses current username
     """
     from linuxdoctor.host_registry import register_host as _register_host
     from linuxdoctor.host_registry import DEFAULT_REGISTRY_PATH as _default_path
 
     path = registry_path or _default_path
 
-    if cpu_cores is None and cpu_sockets is None and description is None:
-        click.echo("⚠️  No metadata specified. Use --cpu-cores, --cpu-sockets, or --description.")
+    if cpu_cores is None and cpu_sockets is None and description is None and ssh_connect is None:
+        click.echo("⚠️  No metadata specified. Use --cpu-cores, --cpu-sockets, --description, or --sshconnect.")
         click.echo(f"   Example: linuxdoctor registerhost {host} --cpu-cores 8")
+        click.echo(f"   Example: linuxdoctor registerhost {host} --sshconnect user@{host}")
         sys.exit(1)
 
     try:
@@ -168,15 +177,52 @@ def registerhost(host, cpu_cores, cpu_sockets, description, registry_path):
             cpu_cores=cpu_cores,
             cpu_sockets=cpu_sockets,
             description=description,
+            ssh_connect=ssh_connect,
             path=path,
         )
         click.echo(f"✅ Registered {host}:")
         for key, value in entry.items():
             click.echo(f"   {key}: {value}")
+        if ssh_connect:
+            click.echo(f"   📡 Metric collection: SSH ({ssh_connect})")
+        else:
+            click.echo(f"   📡 Metric collection: node_exporter")
         click.echo(f"   Registry: {path}")
     except Exception as e:
         click.echo(f"❌ Failed to register {host}: {e}")
         sys.exit(2)
+
+
+@cli.command()
+@click.option("--host", "bind_host", default="0.0.0.0", help="Interface to bind to (default: 0.0.0.0)")
+@click.option("--port", "-p", default=7193, help="Port to listen on (default: 7193)")
+@click.option("--interval", "-i", default=300, type=int, help="Scan interval in seconds (default: 300 = 5 min)")
+@click.option("--node-port", "node_port", default=9100, type=int, help="Node exporter port (default: 9100)")
+@click.option("--threshold", "-t", default="default", help="Threshold profile: default, strict, or relaxed")
+@click.option("--registry", "registry_path", default=None, help="Path to the host registry YAML file")
+def web(bind_host, port, interval, node_port, threshold, registry_path):
+    """Start a web dashboard showing host health status.
+
+    Iterates through registered hosts, connects periodically (default 5 min),
+    and presents a dynamically refreshing dashboard with health indicators
+    for CPU, Context Switching, I/O Wait, and Disk.
+
+    Hover over health icons for details. Click a host name for full analysis.
+
+    Example: linuxdoctor web --port 7193 --interval 300
+    """
+    from linuxdoctor.web import run_dashboard
+    from linuxdoctor.host_registry import DEFAULT_REGISTRY_PATH as _default_path
+
+    reg_path = registry_path or _default_path
+    run_dashboard(
+        host=bind_host,
+        port=port,
+        interval=interval,
+        node_port=node_port,
+        registry_path=reg_path,
+        threshold_profile=threshold,
+    )
 
 
 @cli.command("list-registered")
@@ -191,6 +237,7 @@ def list_registered(registry_path):
     if not hosts:
         click.echo(f"📋 No hosts registered. Registry: {path}")
         click.echo("   Use `linuxdoctor registerhost HOST --cpu-cores N` to register a host.")
+        click.echo("   Use `linuxdoctor registerhost HOST --sshconnect user@host` to register an SSH host.")
         return
 
     click.echo(f"📋 Registered hosts ({len(hosts)}):")
@@ -199,6 +246,11 @@ def list_registered(registry_path):
         click.echo(f"  {host}:")
         for key, value in info.items():
             click.echo(f"    {key}: {value}")
+        # Show collection method
+        if "ssh_connect" in info:
+            click.echo(f"    📡 Collection method: SSH ({info['ssh_connect']})")
+        else:
+            click.echo(f"    📡 Collection method: node_exporter")
     click.echo("=" * 50)
     click.echo(f"Registry: {path}")
 

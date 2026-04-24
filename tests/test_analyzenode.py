@@ -12,6 +12,7 @@ from linuxdoctor.analyzenode import (
     analyze_context_switching,
     parse_metrics,
     _get_thresholds,
+    is_ssh_host,
     NodeMetric,
     Recommendation,
     AnalysisResult,
@@ -295,6 +296,40 @@ class TestAnalyzeDiskIO:
         result = analyze_disk_io(metrics_2, thresholds, previous_metrics=metrics_1)
         assert any(r.category == "disk_io" and r.severity == "critical" for r in result.recommendations)
 
+    def test_ssh_style_util_pct_healthy(self):
+        """SSH-collected node_disk_io_util_pct should be used directly as percentages."""
+        metrics = {
+            "node_disk_io_util_pct": [
+                {"labels": {"device": "sda"}, "value": 30.0},  # 30% — below warn threshold
+            ]
+        }
+        thresholds = _get_thresholds("default")
+        result = analyze_disk_io(metrics, thresholds)
+        # Should have healthy status, no warning
+        assert all(r.severity != "warning" for r in result.recommendations if r.category == "disk_io")
+
+    def test_ssh_style_util_pct_warning(self):
+        """SSH-collected util_pct above warn threshold should produce a warning."""
+        metrics = {
+            "node_disk_io_util_pct": [
+                {"labels": {"device": "sda"}, "value": 75.0},  # 75% — above 70% warn
+            ]
+        }
+        thresholds = _get_thresholds("default")
+        result = analyze_disk_io(metrics, thresholds)
+        assert any(r.category == "disk_io" and r.severity == "warning" for r in result.recommendations)
+
+    def test_ssh_style_util_pct_critical(self):
+        """SSH-collected util_pct above critical threshold should produce a critical recommendation."""
+        metrics = {
+            "node_disk_io_util_pct": [
+                {"labels": {"device": "sda"}, "value": 95.0},  # 95% — above 90% critical
+            ]
+        }
+        thresholds = _get_thresholds("default")
+        result = analyze_disk_io(metrics, thresholds)
+        assert any(r.category == "disk_io" and r.severity == "critical" for r in result.recommendations)
+
 
 class TestAnalyzeContextSwitching:
     """Tests for context switching analysis with counter-aware thresholds."""
@@ -455,3 +490,86 @@ class TestAnalyzeRemoteNode:
 def _extract_recommendations_from_output(output):
     """Helper - placeholder."""
     return []
+
+class TestIsSSHHost:
+    """Tests for is_ssh_host function."""
+
+    def test_ssh_host(self, tmp_path):
+        from linuxdoctor.host_registry import register_host
+        register_host("remote1", ssh_connect="admin@remote1", path=str(tmp_path / "hosts.yaml"))
+        assert is_ssh_host("remote1", registry_path=str(tmp_path / "hosts.yaml")) is True
+
+    def test_non_ssh_host(self, tmp_path):
+        from linuxdoctor.host_registry import register_host
+        register_host("server1", cpu_cores=4, path=str(tmp_path / "hosts.yaml"))
+        assert is_ssh_host("server1", registry_path=str(tmp_path / "hosts.yaml")) is False
+
+    def test_unregistered_host(self, tmp_path):
+        assert is_ssh_host("unknown", registry_path=str(tmp_path / "hosts.yaml")) is False
+
+
+class TestAnalyzeSSHNode:
+    """Tests for analyze_ssh_node function."""
+
+    @patch("linuxdoctor.analyzenode.ssh_test_connection")
+    @patch("linuxdoctor.analyzenode.collect_ssh_metrics")
+    def test_ssh_node_analysis(self, mock_collect, mock_test, tmp_path):
+        """Test that SSH hosts are analyzed via SSH when registered."""
+        from linuxdoctor.host_registry import register_host
+        registry_path = str(tmp_path / "hosts.yaml")
+        register_host("myremote", ssh_connect="admin@myremote", cpu_cores=4, path=registry_path)
+
+        # Mock SSH connection and metric collection
+        mock_test.return_value = (True, "OK")
+        mock_collect.return_value = {
+            "node_cpu_seconds_total": [
+                {"labels": {"cpu": "0", "mode": "idle"}, "value": 90.0},
+                {"labels": {"cpu": "0", "mode": "iowait"}, "value": 5.0},
+                {"labels": {"cpu": "1", "mode": "idle"}, "value": 85.0},
+                {"labels": {"cpu": "1", "mode": "iowait"}, "value": 3.0},
+            ],
+            "node_load1": 0.5,
+            "node_load5": 0.7,
+            "node_load15": 0.9,
+            "node_memory_MemTotal_bytes": 16777216000.0,
+            "node_memory_MemAvailable_bytes": 8388608000.0,
+            "node_context_switches_total": 500000.0,
+        }
+
+        result = analyze_remote_node("myremote", registry_path=registry_path)
+        assert "SSH" in result or "ssh" in result.lower() or "CPU" in result
+
+    @patch("linuxdoctor.analyzenode.ssh_test_connection")
+    def test_ssh_node_connection_failure(self, mock_test, tmp_path):
+        """Test that SSH connection failure produces an error message."""
+        from linuxdoctor.host_registry import register_host
+        registry_path = str(tmp_path / "hosts.yaml")
+        register_host("badhost", ssh_connect="user@badhost", path=registry_path)
+
+        mock_test.return_value = (False, "SSH connection failed")
+
+        result = analyze_remote_node("badhost", registry_path=registry_path)
+        assert "Error" in result or "error" in result.lower() or "failed" in result.lower()
+
+    @patch("linuxdoctor.analyzenode.ssh_test_connection")
+    @patch("linuxdoctor.analyzenode.collect_ssh_metrics")
+    def test_ssh_node_json_output(self, mock_collect, mock_test, tmp_path):
+        """Test SSH node analysis with JSON output."""
+        from linuxdoctor.host_registry import register_host
+        registry_path = str(tmp_path / "hosts.yaml")
+        register_host("myremote", ssh_connect="admin@myremote", cpu_cores=4, path=registry_path)
+
+        mock_test.return_value = (True, "OK")
+        mock_collect.return_value = {
+            "node_cpu_seconds_total": [
+                {"labels": {"cpu": "0", "mode": "idle"}, "value": 90.0},
+            ],
+            "node_load1": 0.5,
+            "node_memory_MemTotal_bytes": 16777216000.0,
+            "node_memory_MemAvailable_bytes": 8388608000.0,
+            "node_context_switches_total": 500000.0,
+        }
+
+        result = analyze_remote_node("myremote", json_output=True, registry_path=registry_path)
+        data = json.loads(result)
+        assert "node" in data

@@ -64,6 +64,7 @@ def register_host(
     cpu_cores: Optional[int] = None,
     cpu_sockets: Optional[int] = None,
     description: Optional[str] = None,
+    ssh_connect: Optional[str] = None,
     path: str = DEFAULT_REGISTRY_PATH,
 ) -> dict:
     """Register or update host metadata.
@@ -73,6 +74,10 @@ def register_host(
         cpu_cores: Total number of CPU cores (logical processors).
         cpu_sockets: Number of physical CPU sockets.
         description: Human-readable description of the host.
+        ssh_connect: SSH connection string (e.g. 'user@host' or 'host').
+            When set, metrics are gathered via SSH using traditional perf
+            tools instead of node_exporter. The user must have
+            passwordless SSH access and accepted host keys configured.
         path: Path to the registry file.
 
     Returns:
@@ -91,6 +96,8 @@ def register_host(
         entry["cpu_sockets"] = cpu_sockets
     if description is not None:
         entry["description"] = description
+    if ssh_connect is not None:
+        entry["ssh_connect"] = ssh_connect
 
     save_registry(registry, path)
     return entry

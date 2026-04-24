@@ -71,6 +71,21 @@ class TestRegisterHost:
         entry = register_host("db1", cpu_cores=16, cpu_sockets=2, path=temp_registry)
         assert entry == {"cpu_cores": 16, "cpu_sockets": 2}
 
+    def test_register_host_with_ssh_connect(self, temp_registry):
+        entry = register_host("remote1", ssh_connect="admin@remote1", cpu_cores=4, path=temp_registry)
+        assert entry["ssh_connect"] == "admin@remote1"
+        assert entry["cpu_cores"] == 4
+
+    def test_register_ssh_only_host(self, temp_registry):
+        entry = register_host("remote2", ssh_connect="remote2", path=temp_registry)
+        assert entry == {"ssh_connect": "remote2"}
+
+    def test_update_existing_host_add_ssh(self, temp_registry):
+        register_host("server1", cpu_cores=4, path=temp_registry)
+        entry = register_host("server1", ssh_connect="admin@server1", path=temp_registry)
+        assert entry["cpu_cores"] == 4
+        assert entry["ssh_connect"] == "admin@server1"
+
     def test_update_existing_host(self, temp_registry):
         register_host("server1", cpu_cores=4, path=temp_registry)
         entry = register_host("server1", cpu_cores=8, path=temp_registry)

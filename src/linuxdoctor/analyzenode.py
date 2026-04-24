@@ -36,6 +36,11 @@ from typing import Optional
 import httpx
 
 from linuxdoctor.host_registry import get_host_info, DEFAULT_REGISTRY_PATH
+from linuxdoctor.ssh_collector import (
+    collect_ssh_metrics,
+    resolve_ssh_connect,
+    ssh_test_connection,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -444,6 +449,10 @@ def analyze_disk_io(metrics: dict, thresholds: dict, previous_metrics: dict = No
     raw value to a threshold is meaningless on a long-running system. We
     compute a utilization rate when two samples are available, or show an
     info notice when only a single sample is present.
+
+    For SSH-collected metrics, node_disk_io_util_pct provides instantaneous
+    utilization percentages from iostat, which are directly comparable to
+    thresholds.
     """
     result = AnalysisResult(category="disk_io")
     recommendations = []
@@ -456,6 +465,35 @@ def analyze_disk_io(metrics: dict, thresholds: dict, previous_metrics: dict = No
 
     io_warn_pct = thresholds["disk_io_util_warn_pct"]
     io_critical_pct = thresholds["disk_io_util_critical_pct"]
+
+    # Check for SSH-style instantaneous utilization percentages first
+    io_util_pct = metrics.get("node_disk_io_util_pct", [])
+    if io_util_pct:
+        for entry in io_util_pct:
+            if "device" not in entry.get("labels", {}):
+                continue
+            device = entry["labels"]["device"]
+            util_pct = entry["value"]
+
+            if util_pct >= io_critical_pct:
+                lines.append(f"  🔴 Device {device}: I/O utilization {util_pct:.1f}% [critical above {io_critical_pct}%]")
+                recommendations.append(Recommendation(
+                    category="disk_io", severity="critical",
+                    message=f"Device {device} I/O utilization is {util_pct:.1f}%, above the {io_critical_pct}% critical threshold.",
+                    action="Check I/O queue: `iostat -x 1 5` and `iotop`. Consider faster storage or workload distribution."
+                ))
+            elif util_pct >= io_warn_pct:
+                lines.append(f"  ⚠️ Device {device}: I/O utilization {util_pct:.1f}% [warning above {io_warn_pct}%]")
+                recommendations.append(Recommendation(
+                    category="disk_io", severity="warning",
+                    message=f"Device {device} I/O utilization is {util_pct:.1f}%, above the {io_warn_pct}% warning threshold.",
+                    action="Check I/O queue: `iostat -x 1 5` and `iotop`."
+                ))
+            else:
+                lines.append(f"  ✅ Device {device}: I/O utilization {util_pct:.1f}% [warning above {io_warn_pct}%]")
+
+        result.recommendations = recommendations
+        return result
 
     io_time = metrics.get("node_disk_io_time_seconds_total", [])
     if not io_time:
@@ -796,7 +834,10 @@ def analyze_remote_node(
     resample_interval: int = None,
     registry_path: str = DEFAULT_REGISTRY_PATH,
 ) -> str:
-    """Analyze a remote node using node_exporter metrics.
+    """Analyze a remote node using node_exporter or SSH metrics.
+
+    If the host is registered with an ssh_connect field, metrics are gathered
+    via SSH using traditional perf tools. Otherwise, node_exporter is used.
 
     Args:
         node_address: Hostname or IP of the target node.
@@ -812,11 +853,25 @@ def analyze_remote_node(
     Returns:
         Formatted analysis string.
     """
+    # Check if this host uses SSH for metric collection
+    host_info = get_host_info(node_address, path=registry_path)
+    if host_info and "ssh_connect" in host_info:
+        return analyze_ssh_node(
+            node_address=node_address,
+            json_output=json_output,
+            include_recommendations=include_recommendations,
+            threshold_profile=threshold_profile,
+            verbose=verbose,
+            resample=resample,
+            resample_interval=resample_interval,
+            registry_path=registry_path,
+        )
+
+    # --- node_exporter path ---
     url = f"http://{node_address}:{port}/metrics"
     thresholds = _get_thresholds(threshold_profile)
 
     # Look up host metadata from registry
-    host_info = get_host_info(node_address, path=registry_path)
     cpu_cores = host_info.get("cpu_cores") if host_info else None
 
     if verbose and host_info:
@@ -836,12 +891,9 @@ def analyze_remote_node(
     if cpu_cores is None:
         cpu_seconds = metrics.get("node_cpu_seconds_total", [])
         if cpu_seconds:
-            # node_exporter exposes per-cpu metrics, so distinct cpu labels = logical CPUs
             cpu_cores = len(set(
                 e["labels"]["cpu"] for e in cpu_seconds if "cpu" in e["labels"]
             ))
-            # Note: this is logical CPUs (including HT), not physical cores.
-            # The registry can provide a more accurate physical core count.
 
     # Optional second sample for rate-based analysis of counters
     previous_metrics = None
@@ -850,10 +902,9 @@ def analyze_remote_node(
         time.sleep(interval)
         try:
             metrics_text_2 = fetch_metrics_text(node_address, port)
-            previous_metrics = metrics  # first sample becomes "previous"
-            metrics = parse_metrics(metrics_text_2)  # second sample is "current"
-        except RuntimeError as e:
-            # If second sample fails, proceed with single-sample analysis
+            previous_metrics = metrics
+            metrics = parse_metrics(metrics_text_2)
+        except RuntimeError:
             pass
 
     # Run all analysis functions
@@ -875,6 +926,145 @@ def analyze_remote_node(
         return _format_json(url, port, metrics, results, include_recommendations, cpu_cores=cpu_cores)
 
     return _format_human(url, results, include_recommendations, node_address=node_address, cpu_cores=cpu_cores)
+
+
+def analyze_ssh_node(
+    node_address: str,
+    json_output: bool = False,
+    include_recommendations: bool = True,
+    threshold_profile: str = "default",
+    verbose: bool = False,
+    resample: bool = False,
+    resample_interval: int = None,
+    registry_path: str = DEFAULT_REGISTRY_PATH,
+) -> str:
+    """Analyze a remote node via SSH using traditional perf tools.
+
+    This is used when a host is registered with --sshconnect, indicating
+    that metrics should be gathered via SSH rather than node_exporter.
+
+    Args:
+        node_address: Hostname or IP of the target node.
+        json_output: If True, output JSON format.
+        include_recommendations: If True, generate recommendations.
+        threshold_profile: Threshold profile: default, strict, or relaxed.
+        verbose: If True, show detailed metric output.
+        resample: If True, take two samples for rate-based counter analysis.
+        resample_interval: Seconds between samples.
+        registry_path: Path to the host registry YAML file.
+
+    Returns:
+        Formatted analysis string.
+    """
+    host_info = get_host_info(node_address, path=registry_path)
+    ssh_connect = resolve_ssh_connect(node_address, host_info)
+    cpu_cores = host_info.get("cpu_cores") if host_info else None
+    thresholds = _get_thresholds(threshold_profile)
+
+    if verbose:
+        click_echo_safe(f"📋 SSH host: {node_address} -> {ssh_connect}")
+        if host_info:
+            click_echo_safe(f"📋 Host registry: {node_address} -> {host_info}")
+
+    # Test SSH connectivity first
+    reachable, message = ssh_test_connection(ssh_connect, allow_interactive=True)
+    if not reachable:
+        if json_output:
+            return json.dumps({"error": f"SSH connection failed: {message}", "node": node_address, "ssh_connect": ssh_connect}, indent=2)
+        return f"Error: SSH connection to {ssh_connect} failed: {message}"
+
+    # Collect metrics via SSH
+    try:
+        metrics = collect_ssh_metrics(ssh_connect, allow_interactive=True)
+    except Exception as e:
+        if json_output:
+            return json.dumps({"error": f"SSH metric collection failed: {e}", "node": node_address}, indent=2)
+        return f"Error: SSH metric collection from {ssh_connect} failed: {e}"
+
+    # Determine CPU cores
+    if cpu_cores is None:
+        cpu_count_val = metrics.get("node_cpu_count")
+        if cpu_count_val is not None:
+            try:
+                cpu_cores = int(cpu_count_val)
+            except (ValueError, TypeError):
+                pass
+        if cpu_cores is None:
+            cpu_seconds = metrics.get("node_cpu_seconds_total", [])
+            if cpu_seconds:
+                cpu_cores = len(set(
+                    e["labels"]["cpu"] for e in cpu_seconds if "cpu" in e["labels"]
+                ))
+
+    # Optional second sample for rate-based analysis
+    previous_metrics = None
+    if resample:
+        interval = resample_interval or RESAMPLE_INTERVAL_SECONDS
+        time.sleep(interval)
+        try:
+            previous_metrics = metrics
+            metrics = collect_ssh_metrics(ssh_connect, allow_interactive=True)
+        except Exception:
+            pass
+
+    # Run all analysis functions
+    results = [
+        analyze_cpu(metrics, thresholds),
+        analyze_memory(metrics, thresholds),
+        analyze_disk(metrics, thresholds),
+        analyze_disk_io(metrics, thresholds, previous_metrics=previous_metrics),
+        analyze_network(metrics, thresholds),
+        analyze_context_switching(
+            metrics, thresholds,
+            cpu_cores=cpu_cores,
+            previous_metrics=previous_metrics,
+            node_address=node_address,
+        ),
+    ]
+
+    url = f"ssh://{ssh_connect}"
+
+    if json_output:
+        return _format_json(url, port=22, metrics=metrics, results=results,
+                            include_recommendations=include_recommendations, cpu_cores=cpu_cores)
+
+    # Use SSH-specific header in human output
+    all_recommendations = []
+    for r in results:
+        all_recommendations.extend(r.recommendations)
+
+    lines = []
+    lines.append("🔍 Linux Doctor v0.1.0")
+    lines.append(f"📊 Analyzing SSH host at {ssh_connect} [via SSH]")
+    lines.append("=" * 50)
+
+    for r in results:
+        lines.extend(r.lines)
+
+    severity_order = {"critical": 0, "warning": 1, "info": 2}
+    all_recommendations.sort(key=lambda r: severity_order.get(r.severity, 3))
+
+    lines.append("")
+    lines.append("=" * 50)
+    if include_recommendations and all_recommendations:
+        lines.append(f"⚠️  RECOMMENDATIONS FOR {ssh_connect}")
+        lines.append("=" * 50)
+        for i, rec in enumerate(all_recommendations, 1):
+            icon = _severity_icon(rec.severity)
+            lines.append(f"{i}. {icon} [{rec.severity.upper()}] {rec.message}")
+            if rec.action:
+                lines.append(f"   → {rec.action}")
+    else:
+        lines.append(f"✅ NO RECOMMENDATIONS - {ssh_connect} LOOKS HEALTHY!")
+    lines.append("=" * 50)
+
+    return "\n".join(lines)
+
+
+def is_ssh_host(host: str, registry_path: str = DEFAULT_REGISTRY_PATH) -> bool:
+    """Check if a host is registered as an SSH host."""
+    host_info = get_host_info(host, path=registry_path)
+    return host_info is not None and "ssh_connect" in host_info
 
 
 def fetch_metrics_text(node_address: str, port: int = 9100, timeout: int = 10) -> str:
