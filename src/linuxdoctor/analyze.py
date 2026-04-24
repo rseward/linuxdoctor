@@ -11,7 +11,7 @@ import sys
 from datetime import datetime
 
 from linuxdoctor.collectors import collect_all, MetricCollection
-from linuxdoctor.recommendations import generate_recommendations, Recommendation
+from linuxdoctor.recommendations import generate_recommendations, generate_install_suggestions, Recommendation
 
 
 def _format_table(rows: list[list[str]], headers: list[str]) -> str:
@@ -42,7 +42,7 @@ def _severity_icon(severity: str) -> str:
     return {"critical": "🔴", "warning": "🟡", "info": "🔵"}.get(severity, "⚪")
 
 
-def _format_human(collections: list[MetricCollection], recommendations: list[Recommendation]) -> str:
+def _format_human(collections: list[MetricCollection], recommendations: list[Recommendation], install_suggestions: list[Recommendation] | None = None) -> str:
     """Format results for human-readable output."""
     lines = []
     lines.append("=" * 72)
@@ -70,6 +70,8 @@ def _format_human(collections: list[MetricCollection], recommendations: list[Rec
             unit_str = f" {m.unit}" if m.unit else ""
             source_str = f" ({m.source})" if m.source else ""
             lines.append(f"    {m.name:<35} {m.value}{unit_str}{source_str}")
+        if coll.missing_tools:
+            lines.append(f"    ⚠  Missing tools: {', '.join(coll.missing_tools)}")
         lines.append("")
 
     # Recommendations
@@ -98,11 +100,29 @@ def _format_human(collections: list[MetricCollection], recommendations: list[Rec
         lines.append("  ✅ No recommendations — system health looks good!")
         lines.append("")
 
+    # Install suggestions for missing metric tools
+    install_suggestions = install_suggestions or []
+    if install_suggestions:
+        lines.append("=" * 72)
+        lines.append("  📦 MISSING TOOL SUGGESTIONS")
+        lines.append("=" * 72)
+        lines.append("")
+        lines.append("  The following metric tools were not found on this system.")
+        lines.append("  Install them for richer data collection:")
+        lines.append("")
+        for sug in install_suggestions:
+            lines.append(f"  🔧 {sug.message}")
+            if sug.detail:
+                lines.append(f"     {sug.detail}")
+            if sug.action:
+                lines.append(f"     → {sug.action}")
+            lines.append("")
+
     lines.append("=" * 72)
     return "\n".join(lines)
 
 
-def _format_json(collections: list[MetricCollection], recommendations: list[Recommendation]) -> str:
+def _format_json(collections: list[MetricCollection], recommendations: list[Recommendation], install_suggestions: list[Recommendation] | None = None) -> str:
     """Format results as JSON."""
     output = {
         "host": platform.node(),
@@ -114,6 +134,7 @@ def _format_json(collections: list[MetricCollection], recommendations: list[Reco
         },
         "metrics": {},
         "recommendations": [],
+        "install_suggestions": [],
     }
 
     for coll in collections:
@@ -133,6 +154,8 @@ def _format_json(collections: list[MetricCollection], recommendations: list[Reco
         }
         if coll.error:
             output["metrics"][coll.category]["error"] = coll.error
+        if coll.missing_tools:
+            output["metrics"][coll.category]["missing_tools"] = coll.missing_tools
 
     for rec in recommendations:
         output["recommendations"].append({
@@ -142,6 +165,16 @@ def _format_json(collections: list[MetricCollection], recommendations: list[Reco
             "message": rec.message,
             "detail": rec.detail,
             "action": rec.action,
+        })
+
+    install_suggestions = install_suggestions or []
+    for sug in install_suggestions:
+        output["install_suggestions"].append({
+            "tool": sug.metric,
+            "category": sug.category,
+            "message": sug.message,
+            "detail": sug.detail,
+            "action": sug.action,
         })
 
     return json.dumps(output, indent=2)
@@ -172,8 +205,11 @@ def analyze_host(
     if include_recommendations:
         recommendations = generate_recommendations(collections, threshold_profile)
 
+    # Generate install suggestions for missing tools (also checks recommendation actions)
+    install_suggestions = generate_install_suggestions(collections, recommendations if include_recommendations else None)
+
     # Format output
     if json_output:
-        return _format_json(collections, recommendations)
+        return _format_json(collections, recommendations, install_suggestions)
     else:
-        return _format_human(collections, recommendations)
+        return _format_human(collections, recommendations, install_suggestions)

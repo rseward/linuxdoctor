@@ -4,8 +4,11 @@ Analyzes collected metrics and generates actionable recommendations,
 analogous to node_exporter best-practice alerts but for local host analysis.
 """
 
+import re as _re
 from dataclasses import dataclass
 from typing import Optional
+
+from linuxdoctor.collectors import TOOL_PACKAGES, _tool_available
 
 
 @dataclass
@@ -74,6 +77,29 @@ def _get_thresholds(profile: str) -> dict:
     return THRESHOLDS.get(profile, THRESHOLDS["default"])
 
 
+def _install_hint(*tool_names: str) -> str:
+    """Return a concise install hint string for one or more tools.
+
+    Example: _install_hint('iotop') -> ' (install: dnf install iotop | apt-get install iotop)'
+    """
+    hints = []
+    seen_pkgs = set()
+    for name in tool_names:
+        pkg_info = TOOL_PACKAGES.get(name)
+        if pkg_info is None:
+            if name not in seen_pkgs:
+                hints.append(f"dnf install {name} | apt-get install {name}")
+                seen_pkgs.add(name)
+        else:
+            key = (pkg_info["dnf"], pkg_info["apt_get"])
+            if key not in seen_pkgs:
+                hints.append(f"dnf install {pkg_info['dnf']} | apt-get install {pkg_info['apt_get']}")
+                seen_pkgs.add(key)
+    if not hints:
+        return ""
+    return f" (install: {'; '.join(hints)})"
+
+
 # ---------------------------------------------------------------------------
 # Metric extraction helpers
 # ---------------------------------------------------------------------------
@@ -124,7 +150,7 @@ def recommend_cpu(collections: list, thresholds: dict) -> list[Recommendation]:
         recs.append(Recommendation(
             category="cpu", severity="warning",
             metric="cpu_idle",
-            message=f"CPU idle is only {cpu_idle}% — system is heavily loaded",
+            message=f"CPU idle is only {cpu_idle}% - system is heavily loaded",
             detail="When CPU idle approaches 0%, processes are competing for CPU time.",
             action="Check for runaway processes with `top -o %CPU`."
         ))
@@ -175,7 +201,7 @@ def recommend_memory(collections: list, thresholds: dict) -> list[Recommendation
             recs.append(Recommendation(
                 category="memory", severity="warning",
                 metric="mem_used_pct",
-                message=f"Memory usage is {mem_used_pct}% — approaching threshold",
+                message=f"Memory usage is {mem_used_pct}% - approaching threshold",
                 detail="Memory pressure is building. Plan capacity accordingly.",
                 action="Monitor with `free -h` and `vmstat -s`."
             ))
@@ -437,6 +463,92 @@ RECOMMENDATION_GENERATORS = {
     "network": recommend_network,
     "load": recommend_load,
 }
+
+
+# ---------------------------------------------------------------------------
+# Install suggestions for unavailable metric tools
+# ---------------------------------------------------------------------------
+
+# Pattern to extract tool names from backtick-enclosed commands
+_BACKTICK_TOOL_PATTERN = _re.compile(r'`([a-zA-Z_][\w-]*)')
+
+
+def generate_install_suggestions(
+    collections: list,
+    recommendations: list | None = None,
+) -> list[Recommendation]:
+    """Generate install-package recommendations for tools that were unavailable during collection.
+
+    For each missing tool, provides the dnf (Fedora/RHEL) and apt-get (Debian/Ubuntu)
+    package name so the user can install it and unlock richer metrics.
+
+    If recommendations are provided, also scans their action text for tool names
+    that aren't installed and suggests installing those too.
+    """
+    # Deduplicate: same tool may be missing across multiple categories
+    seen_missing: set[str] = set()
+    recs: list[Recommendation] = []
+
+    # 1. Tools that collectors flagged as unavailable
+    for coll in collections:
+        for tool_name in coll.missing_tools:
+            if tool_name in seen_missing:
+                continue
+            seen_missing.add(tool_name)
+
+            pkg_info = TOOL_PACKAGES.get(tool_name)
+            if pkg_info is None:
+                # Unknown tool: best-effort suggestion
+                recs.append(Recommendation(
+                    category="install", severity="info",
+                    metric=tool_name,
+                    message=f"Metric tool '{tool_name}' is not installed",
+                    detail=f"Some metrics could not be collected because '{tool_name}' "
+                           f"was not found on this system.",
+                    action=f"dnf install {tool_name}  |  apt-get install {tool_name}"
+                ))
+            else:
+                dnf_pkg = pkg_info["dnf"]
+                apt_pkg = pkg_info["apt_get"]
+                recs.append(Recommendation(
+                    category="install", severity="info",
+                    metric=tool_name,
+                    message=f"Metric tool '{tool_name}' is not installed",
+                    detail=f"Some metrics could not be collected because '{tool_name}' "
+                           f"was not found on this system. "
+                           f"Installing it will enable richer data collection.",
+                    action=f"dnf install {dnf_pkg}  |  apt-get install {apt_pkg}"
+                ))
+
+    # 2. Tools referenced in recommendation actions that aren't installed
+    if recommendations is not None:
+        for rec in recommendations:
+            if not rec.action:
+                continue
+            for match in _BACKTICK_TOOL_PATTERN.finditer(rec.action):
+                tool_name = match.group(1)
+                # Skip tools we've already suggested or that are already installed
+                if tool_name in seen_missing:
+                    continue
+                if _tool_available(tool_name):
+                    continue
+                # Only suggest if we know the package mapping
+                pkg_info = TOOL_PACKAGES.get(tool_name)
+                if pkg_info is None:
+                    continue
+                seen_missing.add(tool_name)
+                dnf_pkg = pkg_info["dnf"]
+                apt_pkg = pkg_info["apt_get"]
+                recs.append(Recommendation(
+                    category="install", severity="info",
+                    metric=tool_name,
+                    message=f"Diagnostic tool '{tool_name}' is not installed",
+                    detail=f"A recommendation suggests using '{tool_name}' but it is not "
+                           f"available on this system. Install it to follow the recommended action.",
+                    action=f"dnf install {dnf_pkg}  |  apt-get install {apt_pkg}"
+                ))
+
+    return recs
 
 
 def generate_recommendations(collections: list, threshold_profile: str = "default") -> list[Recommendation]:

@@ -26,6 +26,7 @@ class MetricCollection:
     category: str
     metrics: list = field(default_factory=list)
     error: Optional[str] = None
+    missing_tools: list = field(default_factory=list)  # tool names that were unavailable during collection
 
 
 def _run_command(cmd: list[str], timeout: int = 10) -> tuple[str, Optional[str]]:
@@ -51,6 +52,149 @@ def _run_command(cmd: list[str], timeout: int = 10) -> tuple[str, Optional[str]]
 def _tool_available(name: str) -> bool:
     """Check if a command-line tool is available on PATH."""
     return shutil.which(name) is not None
+
+
+# ---------------------------------------------------------------------------
+# Package mapping for missing tools
+# ---------------------------------------------------------------------------
+
+# Maps command-line tool names to their dnf (Fedora/RHEL) and apt-get (Debian/Ubuntu)
+# package names. Used to provide install suggestions when a tool is unavailable.
+TOOL_PACKAGES: dict[str, dict[str, str]] = {
+    # CPU / system stat tools
+    "mpstat": {
+        "dnf": "sysstat", "apt_get": "sysstat",
+        "description": "Per-CPU and aggregate CPU utilization statistics",
+        "categories": ["cpu"],
+        "metrics": ["cpu_idle", "cpu_usage"],
+    },
+    "sar": {
+        "dnf": "sysstat", "apt_get": "sysstat",
+        "description": "Historical and real-time system activity reporter",
+        "categories": ["cpu", "network", "sar_history"],
+        "metrics": ["cpu_idle_sar", "tcp_sockets_total", "sar_mem_used_pct", "sar_swap_per_sec", "sar_net_*"],
+    },
+    "iostat": {
+        "dnf": "sysstat", "apt_get": "sysstat",
+        "description": "Device I/O utilization, await times, and service times",
+        "categories": ["io"],
+        "metrics": ["io_*_await_ms", "io_*_svctm_ms", "io_*_util_pct"],
+    },
+    "pidstat": {
+        "dnf": "sysstat", "apt_get": "sysstat",
+        "description": "Per-process CPU, memory, and I/O statistics",
+        "categories": ["cpu", "io", "memory"],
+        "metrics": ["per-process CPU/memory/IO stats"],
+    },
+    "perf": {
+        "dnf": "perf", "apt_get": "linux-tools-common",
+        "description": "Kernel performance events (context switches, cache misses, etc.)",
+        "categories": ["cpu"],
+        "metrics": ["context_switches_per_sec"],
+    },
+    "vmstat": {
+        "dnf": "procps-ng", "apt_get": "procps",
+        "description": "Virtual memory stats: blocks in/out, I/O wait, process queues",
+        "categories": ["io", "load"],
+        "metrics": ["io_blocks_in_per_sec", "io_blocks_out_per_sec", "io_wait_pct", "procs_running", "procs_blocked"],
+    },
+    "uptime": {
+        "dnf": "procps-ng", "apt_get": "procps",
+        "description": "System uptime and load averages",
+        "categories": ["load"],
+        "metrics": ["uptime_raw"],
+    },
+    "ss": {
+        "dnf": "iproute", "apt_get": "iproute2",
+        "description": "Socket statistics (TCP connections, TIME_WAIT, etc.)",
+        "categories": ["network"],
+        "metrics": ["tcp_established", "tcp_timewait"],
+    },
+    # I/O tools
+    "iotop": {
+        "dnf": "iotop", "apt_get": "iotop",
+        "description": "Per-process I/O usage (identifies I/O-heavy processes)",
+        "categories": ["io"],
+        "metrics": ["per-process IO stats"],
+    },
+    "blktrace": {
+        "dnf": "blktrace", "apt_get": "blktrace",
+        "description": "Block device tracing for detailed I/O analysis",
+        "categories": ["io"],
+        "metrics": ["block IO trace data"],
+    },
+    # Disk tools
+    "ncdu": {
+        "dnf": "ncdu", "apt_get": "ncdu",
+        "description": "Interactive disk usage analyzer (recommended for disk cleanup)",
+        "categories": ["disk"],
+        "metrics": ["interactive disk usage analysis"],
+    },
+    "df": {
+        "dnf": "coreutils", "apt_get": "coreutils",
+        "description": "Disk filesystem usage statistics",
+        "categories": ["disk"],
+        "metrics": ["disk_*_total_mb", "disk_*_used_mb", "disk_*_avail_mb", "disk_*_used_pct"],
+    },
+    # Network tools
+    "ethtool": {
+        "dnf": "ethtool", "apt_get": "ethtool",
+        "description": "Network interface driver and link diagnostics",
+        "categories": ["network"],
+        "metrics": ["interface link details"],
+    },
+    "ip": {
+        "dnf": "iproute", "apt_get": "iproute2",
+        "description": "Network interface and routing statistics",
+        "categories": ["network"],
+        "metrics": ["interface link stats"],
+    },
+    # Memory tools
+    "smem": {
+        "dnf": "smem", "apt_get": "smem",
+        "description": "Per-process memory reporting with proportional set size",
+        "categories": ["memory"],
+        "metrics": ["per-process memory breakdown"],
+    },
+    "free": {
+        "dnf": "procps-ng", "apt_get": "procps",
+        "description": "Memory and swap usage summary",
+        "categories": ["memory"],
+        "metrics": ["memory usage summary"],
+    },
+    # Process tools
+    "ps": {
+        "dnf": "procps-ng", "apt_get": "procps",
+        "description": "Process listing and resource usage",
+        "categories": ["cpu", "memory"],
+        "metrics": ["process resource usage"],
+    },
+    "pstree": {
+        "dnf": "psmisc", "apt_get": "psmisc",
+        "description": "Process tree visualization",
+        "categories": ["load"],
+        "metrics": ["process hierarchy"],
+    },
+    "top": {
+        "dnf": "procps-ng", "apt_get": "procps",
+        "description": "Real-time process monitor",
+        "categories": ["cpu", "memory"],
+        "metrics": ["live process stats"],
+    },
+    # Logging
+    "journalctl": {
+        "dnf": "systemd", "apt_get": "systemd",
+        "description": "System journal logs for boot and crash analysis",
+        "categories": ["load"],
+        "metrics": ["boot/crash logs"],
+    },
+    "dmesg": {
+        "dnf": "util-linux", "apt_get": "util-linux",
+        "description": "Kernel ring buffer messages",
+        "categories": ["io", "load"],
+        "metrics": ["kernel messages"],
+    },
+}
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +235,9 @@ def collect_cpu_metrics() -> MetricCollection:
                         ))
                     break
 
+    else:
+        collection.missing_tools.append("mpstat")
+
     # sar -u (CPU utilization)
     if _tool_available("sar"):
         stdout, err = _run_command(["sar", "-u", "1", "1"])
@@ -111,6 +258,8 @@ def collect_cpu_metrics() -> MetricCollection:
                     except (ValueError, IndexError):
                         pass
                     break
+    else:
+        collection.missing_tools.append("sar")
 
     # Load averages from /proc/loadavg (always available)
     try:
@@ -157,6 +306,8 @@ def collect_cpu_metrics() -> MetricCollection:
                             source="perf stat", raw_output=stdout
                         ))
                     break
+    else:
+        collection.missing_tools.append("perf")
 
     return collection
 
@@ -379,6 +530,9 @@ def collect_io_metrics() -> MetricCollection:
                         except (ValueError, IndexError):
                             pass
 
+    else:
+        collection.missing_tools.append("iostat")
+
     # vmstat - disk I/O summary
     if _tool_available("vmstat"):
         stdout, err = _run_command(["vmstat", "1", "2"])
@@ -406,6 +560,8 @@ def collect_io_metrics() -> MetricCollection:
                         ))
                     except (ValueError, IndexError):
                         pass
+    else:
+        collection.missing_tools.append("vmstat")
 
     return collection
 
@@ -472,6 +628,9 @@ def collect_network_metrics() -> MetricCollection:
                         ))
                     break
 
+    else:
+        collection.missing_tools.append("ss")
+
     # Network connections in various states (sar -n SOCK if available)
     if _tool_available("sar"):
         stdout, err = _run_command(["sar", "-n", "SOCK", "1", "1"])
@@ -487,6 +646,9 @@ def collect_network_metrics() -> MetricCollection:
                     except (ValueError, IndexError):
                         pass
                     break
+
+    else:
+        collection.missing_tools.append("sar")
 
     return collection
 
@@ -506,8 +668,10 @@ def collect_load_metrics() -> MetricCollection:
             collection.metrics.append(MetricResult(
                 name="uptime_raw", value=stdout.strip(), source="uptime"
             ))
+    else:
+        collection.missing_tools.append("uptime")
 
-    # /proc/loadavg (supplemental, also captured in CPU)
+    # /proc/uptime (always available)
     try:
         with open("/proc/uptime") as f:
             uptime_seconds = float(f.read().split()[0])
@@ -555,6 +719,8 @@ def collect_load_metrics() -> MetricCollection:
                         ))
                     except (ValueError, IndexError):
                         pass
+    else:
+        collection.missing_tools.append("vmstat")
 
     return collection
 
@@ -568,6 +734,7 @@ def collect_sar_metrics() -> MetricCollection:
     collection = MetricCollection(category="sar_history")
 
     if not _tool_available("sar"):
+        collection.missing_tools.append("sar")
         collection.metrics.append(MetricResult(
             name="sar_available", value=False, source="sar",
             error="sar (sysstat) not installed"
