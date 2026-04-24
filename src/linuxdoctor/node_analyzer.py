@@ -2,6 +2,8 @@
 
 from linuxdoctor.analyzenode import (
     analyze_remote_node,
+    analyze_ssh_node,
+    is_ssh_host,
     fetch_node_metrics,
     fetch_metrics_text,
     NodeMetric,
@@ -11,6 +13,8 @@ from linuxdoctor.analyzenode import (
 
 __all__ = [
     "analyze_remote_node",
+    "analyze_ssh_node",
+    "is_ssh_host",
     "fetch_node_metrics",
     "fetch_metrics_text",
     "NodeMetric",

@@ -78,6 +78,49 @@ When context switch warnings are triggered without a registered core count, linu
 
 Registry data is stored in `~/.config/linuxdoctor/hosts.yaml`.
 
+### Analyzing Remote Nodes via SSH
+
+For hosts that don't run node_exporter, you can collect metrics via SSH using traditional Linux performance tools (mpstat, vmstat, iostat, /proc). This requires:
+
+- **Passwordless SSH access** — key-based authentication must be set up
+- **Host keys accepted** — run `ssh user@host` once to accept the key
+- **sysstat package** — `mpstat` and `iostat` should be available on the remote host
+
+#### Registering an SSH Host
+
+```bash
+# Register a host for SSH metric collection
+linuxdoctor registerhost remote1 --sshconnect admin@remote1 --cpu-cores 4
+linuxdoctor registerhost remote2 --sshconnect remote2  # uses current username
+
+# List registered hosts (shows collection method)
+linuxdoctor list-registered
+```
+
+#### Analyzing an SSH Host
+
+Once registered with `--sshconnect`, the `analyzenode` command automatically detects the SSH collection method:
+
+```bash
+# This will use SSH instead of node_exporter
+linuxdoctor analyzenode remote1
+
+# All regular options work
+linuxdoctor analyzenode remote1 --json-output
+linuxdoctor analyzenode remote1 --threshold strict
+linuxdoctor analyzenode remote1 --resample
+```
+
+When run from the CLI, SSH connections allow interactive prompts (host key acceptance, passwords). From the web dashboard, `BatchMode=yes` is used — hosts requiring interactive auth are marked as unreachable.
+
+#### Web Dashboard with SSH Hosts
+
+```bash
+linuxdoctor web
+```
+
+The dashboard shows SSH hosts with a **SSH** badge. Click any host for detailed analysis. SSH hosts that can't be reached (host key not accepted, password required) are shown as **unreachable** with guidance on how to fix the connection.
+
 ### List hosts from Prometheus
 
 ```bash
@@ -93,11 +136,12 @@ Discovers available hosts from a Prometheus server's targets API.
 | Command | Description |
 |---------|-------------|
 | `analyze` | Analyze the current host using local performance tools |
-| `analyzenode` | Analyze a remote node using node_exporter metrics |
+| `analyzenode` | Analyze a remote node (node_exporter or SSH) |
 | `list-hosts` | List available hosts from a Prometheus server |
-| `registerhost` | Register host metadata (CPU cores, etc.) for more accurate analysis |
+| `registerhost` | Register host metadata (CPU cores, SSH connection) |
 | `list-registered` | List all registered hosts and their metadata |
 | `unregisterhost` | Remove a host from the registry |
+| `web` | Start the web dashboard |
 
 ## Options
 
@@ -142,11 +186,14 @@ src/linuxdoctor/
 ├── __init__.py          # Package init with re-exports
 ├── cli.py               # Click CLI entry point
 ├── analyze.py            # Local host analysis (sar, vmstat, etc.)
-├── analyzenode.py        # Remote node analysis (node_exporter)
+├── analyzenode.py        # Remote node analysis (node_exporter & SSH)
 │                        #   Counter-aware: uses rate() for counters, not raw values
 │                        #   Supports --resample for two-sample rate computation
+│                        #   SSH mode: collects via traditional perf tools over SSH
 ├── collectors.py         # Local metric collectors
-├── host_registry.py      # Host metadata registry (CPU cores, etc.)
+├── host_registry.py      # Host metadata registry (CPU cores, SSH connections)
+├── ssh_collector.py      # SSH metric collection (mpstat, vmstat, iostat, etc.)
+├── web.py                # Web dashboard (node_exporter + SSH hosts)
 ├── recommendations.py    # Local recommendation engine
 ├── prometheus.py         # Prometheus host discovery
 └── node_analyzer.py      # Re-export of analyzenode for compatibility
@@ -169,7 +216,8 @@ linuxdoctor's remote analysis (`analyzenode`) is designed to avoid the common pi
 ## Requirements
 
 - Linux system with standard performance tools for local analysis: `sar` (sysstat), `vmstat`, `iostat`, `mpstat`, `free`, `df`, `perf`, `uptime`
-- Remote node analysis requires a running `node_exporter` on the target host
+- Remote node analysis (node_exporter mode): a running `node_exporter` on the target host
+- Remote node analysis (SSH mode): `ssh` client, passwordless key-based auth, and `sysstat` package on the remote host
 - `list-hosts` requires access to a Prometheus server API
 - Python 3.9+
 
