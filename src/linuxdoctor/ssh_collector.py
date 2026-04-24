@@ -444,9 +444,13 @@ REMOTE_DIAGNOSTIC_TOOLS = [
 def check_remote_tools(ssh_connect: str, allow_interactive: bool = False) -> list[str]:
     """Check which diagnostic tools are unavailable on a remote host via SSH.
 
-    Runs 'which <tool>' for each tool in REMOTE_DIAGNOSTIC_TOOLS over a single
-    SSH connection to minimize round trips. Returns a list of tool names that
-    were not found on the remote system.
+    Runs 'command -v <tool>' for each tool in REMOTE_DIAGNOSTIC_TOOLS over a
+    single SSH connection to minimize round trips. Returns a list of tool
+    names that were not found on the remote system.
+
+    The PATH is expanded to include /usr/sbin and /sbin so that system
+    tools (like ethtool, blktrace) installed outside the non-root user's
+    default PATH are still found.
 
     Args:
         ssh_connect: SSH connection string (e.g. 'user@host').
@@ -455,14 +459,24 @@ def check_remote_tools(ssh_connect: str, allow_interactive: bool = False) -> lis
     Returns:
         List of tool names that are NOT available on the remote host.
     """
-    # Build a compound command that checks all tools in one SSH round-trip
-    checks = []
-    for tool in REMOTE_DIAGNOSTIC_TOOLS:
-        checks.append(f"command -v {tool} >/dev/null 2>&1 || echo {tool}")
-    cmd = " && ".join(["true"] + checks) if checks else "true"
-    # Simpler: just run them all with || and collect the missing ones
-    # Using a single SSH call to minimize latency
-    compound_cmd = "; ".join(f"command -v {t} >/dev/null 2>&1 || echo MISSING:{t}" for t in REMOTE_DIAGNOSTIC_TOOLS)
+    # Expand PATH to include sbin directories so tools like ethtool, blktrace
+    # (typically in /usr/sbin or /sbin) are found even for non-root SSH users.
+    # Also map alternate binary names: some distros install iotop as iotop-py.
+    path_prefix = 'PATH=/usr/local/sbin:/usr/sbin:/sbin:$PATH'
+
+    # Build check commands: try the canonical name, then any known aliases
+    tool_aliases = {
+        "iotop": ["iotop", "iotop-py"],
+    }
+
+    check_cmds = []
+    for t in REMOTE_DIAGNOSTIC_TOOLS:
+        aliases = tool_aliases.get(t, [t])
+        # Tool is "found" if ANY of its aliases exist
+        alias_checks = " || ".join(f"command -v {a} >/dev/null 2>&1" for a in aliases)
+        check_cmds.append(f"( {alias_checks} ) || echo MISSING:{t}")
+
+    compound_cmd = path_prefix + "; " + "; ".join(check_cmds)
 
     result = ssh_run(ssh_connect, compound_cmd, timeout=15, allow_interactive=allow_interactive)
     if result.error:
