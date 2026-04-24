@@ -80,20 +80,20 @@ def _get_thresholds(profile: str) -> dict:
 def _install_hint(*tool_names: str) -> str:
     """Return a concise install hint string for one or more tools.
 
-    Example: _install_hint('iotop') -> ' (install: dnf install iotop | apt-get install iotop)'
+    Example: _install_hint('iotop') -> ' (install: Fedora/RHEL: dnf install iotop | Debian/Ubuntu: apt-get install iotop)'
     """
     hints = []
     seen_pkgs = set()
     for name in tool_names:
-        pkg_info = TOOL_PACKAGES.get(name)
+        pkg_info = _get_pkg_info(name)
         if pkg_info is None:
             if name not in seen_pkgs:
-                hints.append(f"dnf install {name} | apt-get install {name}")
+                hints.append(f"Fedora/RHEL: dnf install {name} | Debian/Ubuntu: apt-get install {name}")
                 seen_pkgs.add(name)
         else:
             key = (pkg_info["dnf"], pkg_info["apt_get"])
             if key not in seen_pkgs:
-                hints.append(f"dnf install {pkg_info['dnf']} | apt-get install {pkg_info['apt_get']}")
+                hints.append(f"Fedora/RHEL: dnf install {pkg_info['dnf']} | Debian/Ubuntu: apt-get install {pkg_info['apt_get']}")
                 seen_pkgs.add(key)
     if not hints:
         return ""
@@ -472,6 +472,110 @@ RECOMMENDATION_GENERATORS = {
 # Pattern to extract tool names from backtick-enclosed commands
 _BACKTICK_TOOL_PATTERN = _re.compile(r'`([a-zA-Z_][\w-]*)')
 
+# Fallback package names for tools not in TOOL_PACKAGES.
+# Maps tool name -> {"dnf": ..., "apt_get": ..., "description": ...}
+_UNKNOWN_TOOL_PACKAGES: dict[str, dict[str, str]] = {
+    "numactl": {"dnf": "numactl", "apt_get": "numactl",
+                "description": "NUMA policy and hardware topology inspection"},
+    "lscpu": {"dnf": "util-linux", "apt_get": "util-linux",
+              "description": "CPU architecture information"},
+    "lspci": {"dnf": "pciutils", "apt_get": "pciutils",
+              "description": "PCI hardware device listing"},
+    "lsblk": {"dnf": "util-linux", "apt_get": "util-linux",
+              "description": "Block device listing and topology"},
+    "tuned-adm": {"dnf": "tuned", "apt_get": "tuned",
+                  "description": "System tuning profile manager (RHEL/Fedora)"},
+    "hdparm": {"dnf": "hdparm", "apt_get": "hdparm",
+              "description": "Hard disk parameters and performance testing"},
+    "smartctl": {"dnf": "smartmontools", "apt_get": "smartmontools",
+                "description": "SMART disk health monitoring and diagnostics"},
+    "nfsstat": {"dnf": "nfs-utils", "apt_get": "nfs-common",
+               "description": "NFS client/server statistics"},
+    "nstat": {"dnf": "iproute", "apt_get": "iproute2",
+              "description": "Network SNMP-style statistics"},
+    "tcpdump": {"dnf": "tcpdump", "apt_get": "tcpdump",
+                "description": "Network packet capture and analysis"},
+    "lsof": {"dnf": "lsof", "apt_get": "lsof",
+             "description": "List open files and network connections per process"},
+    "strace": {"dnf": "strace", "apt_get": "strace",
+              "description": "System call tracer for process debugging"},
+    "numastat": {"dnf": "numactl", "apt_get": "numactl",
+                "description": "NUMA memory allocation statistics"},
+    "trace-cmd": {"dnf": "trace-cmd", "apt_get": "trace-cmd",
+                  "description": "Kernel ftrace front-end for function tracing"},
+    "bpftrace": {"dnf": "bpftrace", "apt_get": "bpftrace",
+                "description": "eBPF-based tracing and performance analysis"},
+}
+
+
+def _get_pkg_info(tool_name: str) -> dict | None:
+    """Look up package info for a tool, checking TOOL_PACKAGES then the fallback map."""
+    info = TOOL_PACKAGES.get(tool_name)
+    if info is not None:
+        return info
+    return _UNKNOWN_TOOL_PACKAGES.get(tool_name)
+
+
+def _format_action(dnf_pkg: str, apt_pkg: str) -> str:
+    """Format install action with clear platform-specific commands."""
+    if dnf_pkg == apt_pkg:
+        return (f"Fedora/RHEL: dnf install {dnf_pkg}  |  "
+                f"Debian/Ubuntu: apt-get install {apt_pkg}")
+    return (f"Fedora/RHEL: dnf install {dnf_pkg}  |  "
+            f"Debian/Ubuntu: apt-get install {apt_pkg}")
+
+
+def _build_detail_for_tool(tool_name: str, pkg_info: dict | None, is_diagnostic: bool = False, collection_categories: list[str] | None = None) -> str:
+    """Build a detailed description for a missing tool suggestion.
+
+    Includes what the tool does, which metric categories are affected,
+    and what metrics become available after installation.
+
+    Args:
+        tool_name: Name of the missing tool.
+        pkg_info: Package info dict (from TOOL_PACKAGES or _UNKNOWN_TOOL_PACKAGES), or None.
+        is_diagnostic: If True, the tool was referenced in a recommendation action.
+        collection_categories: Categories (from MetricCollection.category) that reported
+            this tool as missing. Used when pkg_info has no categories field.
+    """
+    parts = []
+
+    if is_diagnostic:
+        parts.append(f"A recommendation suggests using '{tool_name}' but it is not "
+                     f"available on this system.")
+    else:
+        parts.append(f"'{tool_name}' was not found on this system, so some metrics "
+                     f"could not be collected.")
+
+    # Add description of what the tool provides
+    if pkg_info:
+        desc = pkg_info.get("description")
+        if desc:
+            parts.append(f"Provides: {desc}")
+
+        # Add affected categories if available
+        categories = pkg_info.get("categories")
+        if categories:
+            cat_str = ", ".join(categories)
+            parts.append(f"Affected categories: {cat_str}")
+        elif collection_categories:
+            # Fallback: use the collection categories that reported the tool missing
+            cat_str = ", ".join(collection_categories)
+            parts.append(f"Affects: {cat_str}")
+
+        # Add specific metrics if available
+        metrics = pkg_info.get("metrics")
+        if metrics and isinstance(metrics, list):
+            metrics_str = ", ".join(str(m) for m in metrics[:5])
+            suffix = "..." if len(metrics) > 5 else ""
+            parts.append(f"Metrics enabled: {metrics_str}{suffix}")
+    elif collection_categories:
+        # No pkg_info at all but we know which categories were affected
+        cat_str = ", ".join(collection_categories)
+        parts.append(f"Affects: {cat_str}")
+
+    return " ".join(parts)
+
 
 def generate_install_suggestions(
     collections: list,
@@ -482,6 +586,10 @@ def generate_install_suggestions(
     For each missing tool, provides the dnf (Fedora/RHEL) and apt-get (Debian/Ubuntu)
     package name so the user can install it and unlock richer metrics.
 
+    When multiple missing tools come from the same package (e.g., mpstat, sar, iostat,
+    pidstat all ship in 'sysstat'), they are grouped into a single suggestion to avoid
+    redundant install commands.
+
     If recommendations are provided, also scans their action text for tool names
     that aren't installed and suggests installing those too.
     """
@@ -489,36 +597,105 @@ def generate_install_suggestions(
     seen_missing: set[str] = set()
     recs: list[Recommendation] = []
 
+    # Track which collection categories reported each tool as missing
+    # (used for unknown tools that don't have categories in their pkg_info)
+    _tool_categories: dict[str, list[str]] = {}
+
     # 1. Tools that collectors flagged as unavailable
+    # Group tools by their install package so we can emit one suggestion per package
+    # instead of one per tool (e.g., sysstat covers mpstat + sar + iostat + pidstat)
+    _package_groups: dict[str, dict] = {}  # key: "dnf:apt" -> {tools: [], pkg_info: dict}
+    _ungrouped: list[tuple[str, dict | None]] = []  # tools with no known package
+
     for coll in collections:
         for tool_name in coll.missing_tools:
+            if tool_name not in _tool_categories:
+                _tool_categories[tool_name] = []
+            if coll.category not in _tool_categories[tool_name]:
+                _tool_categories[tool_name].append(coll.category)
+
             if tool_name in seen_missing:
                 continue
             seen_missing.add(tool_name)
 
-            pkg_info = TOOL_PACKAGES.get(tool_name)
+            pkg_info = _get_pkg_info(tool_name)
             if pkg_info is None:
-                # Unknown tool: best-effort suggestion
-                recs.append(Recommendation(
-                    category="install", severity="info",
-                    metric=tool_name,
-                    message=f"Metric tool '{tool_name}' is not installed",
-                    detail=f"Some metrics could not be collected because '{tool_name}' "
-                           f"was not found on this system.",
-                    action=f"dnf install {tool_name}  |  apt-get install {tool_name}"
-                ))
+                # Truly unknown tool — provide best-effort suggestion individually
+                _ungrouped.append((tool_name, None))
             else:
                 dnf_pkg = pkg_info["dnf"]
                 apt_pkg = pkg_info["apt_get"]
-                recs.append(Recommendation(
-                    category="install", severity="info",
-                    metric=tool_name,
-                    message=f"Metric tool '{tool_name}' is not installed",
-                    detail=f"Some metrics could not be collected because '{tool_name}' "
-                           f"was not found on this system. "
-                           f"Installing it will enable richer data collection.",
-                    action=f"dnf install {dnf_pkg}  |  apt-get install {apt_pkg}"
-                ))
+                group_key = f"{dnf_pkg}:{apt_pkg}"
+                if group_key not in _package_groups:
+                    _package_groups[group_key] = {
+                        "tools": [],
+                        "dnf_pkg": dnf_pkg,
+                        "apt_pkg": apt_pkg,
+                        "pkg_info": pkg_info,
+                    }
+                _package_groups[group_key]["tools"].append(tool_name)
+
+    # Generate grouped suggestions (one per package), sorted for deterministic output
+    for group_key in sorted(_package_groups.keys()):
+        group = _package_groups[group_key]
+        tools = group["tools"]
+        dnf_pkg = group["dnf_pkg"]
+        apt_pkg = group["apt_pkg"]
+        pkg_info = group["pkg_info"]
+
+        if len(tools) == 1:
+            tool_name = tools[0]
+            recs.append(Recommendation(
+                category="install", severity="info",
+                metric=tool_name,
+                message=f"Metric tool '{tool_name}' is not installed",
+                detail=_build_detail_for_tool(tool_name, pkg_info, collection_categories=_tool_categories.get(tool_name)),
+                action=_format_action(dnf_pkg, apt_pkg),
+            ))
+        else:
+            # Multiple tools from the same package — combine into one suggestion
+            tool_list = ", ".join(f"'{t}'" for t in sorted(tools))
+            # Merge descriptions and categories from all tools in the group
+            descs = []
+            all_categories = set()
+            all_metrics = []
+            for t in tools:
+                t_info = TOOL_PACKAGES.get(t) or _UNKNOWN_TOOL_PACKAGES.get(t, {})
+                if t_info.get("description"):
+                    descs.append(f"{t}: {t_info['description']}")
+                if t_info.get("categories"):
+                    all_categories.update(t_info["categories"])
+                if t_info.get("metrics") and isinstance(t_info["metrics"], list):
+                    all_metrics.extend(t_info["metrics"])
+
+            detail_parts = [f"The following tools were not found: {tool_list}."]
+            if descs:
+                detail_parts.append("All are provided by the same package.")
+                for d in descs:
+                    detail_parts.append(f"  - {d}")
+            if all_categories:
+                cat_str = ", ".join(sorted(all_categories))
+                detail_parts.append(f"Affected categories: {cat_str}")
+
+            recs.append(Recommendation(
+                category="install", severity="info",
+                metric=group_key.replace(":", "/"),
+                message=f"Package '{dnf_pkg}' is not installed (provides {tool_list})",
+                detail=" ".join(detail_parts),
+                action=_format_action(dnf_pkg, apt_pkg),
+            ))
+
+    # Generate individual suggestions for truly unknown tools, sorted for deterministic output
+    for tool_name, pkg_info in sorted(_ungrouped, key=lambda x: x[0]):
+        recs.append(Recommendation(
+            category="install", severity="info",
+            metric=tool_name,
+            message=f"Metric tool '{tool_name}' is not installed",
+            detail=_build_detail_for_tool(tool_name, pkg_info, collection_categories=_tool_categories.get(tool_name)),
+            action=(f"Fedora/RHEL: dnf install {tool_name}  |  "
+                    f"Debian/Ubuntu: apt-get install {tool_name}  "
+                    f"(package name may differ — search with 'dnf search {tool_name}' or 'apt-cache search {tool_name}')"),
+        ))
 
     # 2. Tools referenced in recommendation actions that aren't installed
     if recommendations is not None:
@@ -533,7 +710,7 @@ def generate_install_suggestions(
                 if _tool_available(tool_name):
                     continue
                 # Only suggest if we know the package mapping
-                pkg_info = TOOL_PACKAGES.get(tool_name)
+                pkg_info = _get_pkg_info(tool_name)
                 if pkg_info is None:
                     continue
                 seen_missing.add(tool_name)
@@ -543,9 +720,8 @@ def generate_install_suggestions(
                     category="install", severity="info",
                     metric=tool_name,
                     message=f"Diagnostic tool '{tool_name}' is not installed",
-                    detail=f"A recommendation suggests using '{tool_name}' but it is not "
-                           f"available on this system. Install it to follow the recommended action.",
-                    action=f"dnf install {dnf_pkg}  |  apt-get install {apt_pkg}"
+                    detail=_build_detail_for_tool(tool_name, pkg_info, is_diagnostic=True),
+                    action=_format_action(dnf_pkg, apt_pkg),
                 ))
 
     return recs
