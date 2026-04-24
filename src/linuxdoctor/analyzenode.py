@@ -38,6 +38,7 @@ import httpx
 from linuxdoctor.host_registry import get_host_info, DEFAULT_REGISTRY_PATH
 from linuxdoctor.ssh_collector import (
     collect_ssh_metrics,
+    check_remote_tools,
     resolve_ssh_connect,
     ssh_test_connection,
 )
@@ -1097,10 +1098,18 @@ def analyze_ssh_node(
     for r in results:
         all_recommendations.extend(r.recommendations)
 
+    # Also check which diagnostic tools are unavailable on the remote host.
+    # This catches tools like iotop, perf, ethtool, etc. that aren't used by
+    # the SSH collector directly but are referenced in recommendation actions.
+    remote_missing = check_remote_tools(ssh_connect, allow_interactive=True)
+
+    # Merge: collection failures + remote availability check
+    all_missing = list(set(ssh_missing_tools + remote_missing))
+
     from linuxdoctor.collectors import MetricCollection
     missing_collections = []
-    if ssh_missing_tools:
-        mc = MetricCollection(category="ssh_collection", missing_tools=ssh_missing_tools)
+    if all_missing:
+        mc = MetricCollection(category="ssh_collection", missing_tools=all_missing)
         missing_collections.append(mc)
 
     install_suggestions = generate_install_suggestions(

@@ -8,6 +8,7 @@ from linuxdoctor.ssh_collector import (
     ssh_test_connection,
     resolve_ssh_connect,
     collect_ssh_metrics,
+    check_remote_tools,
 )
 
 
@@ -219,3 +220,74 @@ SwapFree:        2097152 kB"""
         metrics = collect_ssh_metrics("user@host")
         assert "node_context_switches_total" in metrics
         assert metrics["node_context_switches_total"] == 12345678.0
+
+    @patch("linuxdoctor.ssh_collector.ssh_run")
+    def test_collect_ssh_metrics_tracks_missing_tools(self, mock_ssh_run):
+        """Test that collect_ssh_metrics populates missing_tools when commands fail."""
+
+        def mock_run_side_effect(ssh_connect, command, **kwargs):
+            # mpstat fails — should be tracked as missing
+            if "mpstat" in command:
+                return SSHResult(error="command not found: mpstat")
+            # iostat fails — should be tracked as missing
+            if "iostat" in command:
+                return SSHResult(error="command not found: iostat")
+            # Everything else succeeds
+            if "meminfo" in command:
+                return SSHResult(stdout="MemTotal:       16384000 kB\nMemAvailable:   14000000 kB\n", returncode=0)
+            if "loadavg" in command:
+                return SSHResult(stdout="0.50 0.75 1.00 2/128 12345", returncode=0)
+            if "grep ctxt" in command:
+                return SSHResult(stdout="ctxt 12345678", returncode=0)
+            if "nproc" in command:
+                return SSHResult(stdout="4", returncode=0)
+            return SSHResult(error="not available")
+
+        mock_ssh_run.side_effect = mock_run_side_effect
+        missing_tools = []
+        metrics = collect_ssh_metrics("user@host", missing_tools=missing_tools)
+        assert "mpstat" in missing_tools
+        assert "iostat" in missing_tools
+        # Should still have some metrics from /proc
+        assert "node_memory_MemTotal_bytes" in metrics
+
+
+class TestCheckRemoteTools:
+    """Tests for check_remote_tools function."""
+
+    @patch("linuxdoctor.ssh_collector.ssh_run")
+    def test_all_tools_available(self, mock_ssh_run):
+        """No tools missing should return empty list."""
+        mock_ssh_run.return_value = SSHResult(stdout="", returncode=0, error=None)
+        result = check_remote_tools("user@host")
+        assert result == []
+
+    @patch("linuxdoctor.ssh_collector.ssh_run")
+    def test_some_tools_missing(self, mock_ssh_run):
+        """Should report missing tools."""
+        mock_ssh_run.return_value = SSHResult(
+            stdout="MISSING:iotop\nMISSING:perf\nMISSING:smem",
+            returncode=0, error=None
+        )
+        result = check_remote_tools("user@host")
+        assert "iotop" in result
+        assert "perf" in result
+        assert "smem" in result
+
+    @patch("linuxdoctor.ssh_collector.ssh_run")
+    def test_ssh_connection_failure(self, mock_ssh_run):
+        """SSH failure should return empty list (can't determine availability)."""
+        mock_ssh_run.return_value = SSHResult(error="Connection refused")
+        result = check_remote_tools("user@host")
+        assert result == []
+
+    @patch("linuxdoctor.ssh_collector.ssh_run")
+    def test_all_tools_missing(self, mock_ssh_run):
+        """All tools missing should return full list."""
+        from linuxdoctor.ssh_collector import REMOTE_DIAGNOSTIC_TOOLS
+        missing_lines = "\n".join(f"MISSING:{t}" for t in REMOTE_DIAGNOSTIC_TOOLS)
+        mock_ssh_run.return_value = SSHResult(stdout=missing_lines, returncode=0, error=None)
+        result = check_remote_tools("user@host")
+        assert len(result) == len(REMOTE_DIAGNOSTIC_TOOLS)
+        for tool in REMOTE_DIAGNOSTIC_TOOLS:
+            assert tool in result

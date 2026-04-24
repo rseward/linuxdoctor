@@ -425,3 +425,55 @@ def _collect_ssh_context_switches(ssh_connect: str, metrics: dict, allow_interac
                 metrics["node_context_switches_total"] = float(parts[1])
             except (ValueError, IndexError):
                 pass
+
+
+# ---------------------------------------------------------------------------
+# Remote tool availability check
+# ---------------------------------------------------------------------------
+
+# Tools that linuxdoctor recommendations may reference in action text.
+# We check these on remote hosts so we can suggest installing them.
+REMOTE_DIAGNOSTIC_TOOLS = [
+    "mpstat", "sar", "iostat", "pidstat", "perf",
+    "vmstat", "ss", "iotop", "blktrace",
+    "ncdu", "ethtool", "smem",
+    "pstree",
+]
+
+
+def check_remote_tools(ssh_connect: str, allow_interactive: bool = False) -> list[str]:
+    """Check which diagnostic tools are unavailable on a remote host via SSH.
+
+    Runs 'which <tool>' for each tool in REMOTE_DIAGNOSTIC_TOOLS over a single
+    SSH connection to minimize round trips. Returns a list of tool names that
+    were not found on the remote system.
+
+    Args:
+        ssh_connect: SSH connection string (e.g. 'user@host').
+        allow_interactive: Allow interactive SSH prompts.
+
+    Returns:
+        List of tool names that are NOT available on the remote host.
+    """
+    # Build a compound command that checks all tools in one SSH round-trip
+    checks = []
+    for tool in REMOTE_DIAGNOSTIC_TOOLS:
+        checks.append(f"command -v {tool} >/dev/null 2>&1 || echo {tool}")
+    cmd = " && ".join(["true"] + checks) if checks else "true"
+    # Simpler: just run them all with || and collect the missing ones
+    # Using a single SSH call to minimize latency
+    compound_cmd = "; ".join(f"command -v {t} >/dev/null 2>&1 || echo MISSING:{t}" for t in REMOTE_DIAGNOSTIC_TOOLS)
+
+    result = ssh_run(ssh_connect, compound_cmd, timeout=15, allow_interactive=allow_interactive)
+    if result.error:
+        # SSH connection issue — can't determine tool availability
+        return []
+
+    missing = []
+    for line in result.stdout.strip().splitlines():
+        line = line.strip()
+        if line.startswith("MISSING:"):
+            tool_name = line[len("MISSING:"):]
+            missing.append(tool_name)
+
+    return missing
