@@ -41,6 +41,7 @@ from linuxdoctor.ssh_collector import (
     resolve_ssh_connect,
     ssh_test_connection,
 )
+from linuxdoctor.recommendations import generate_install_suggestions
 
 
 # ---------------------------------------------------------------------------
@@ -71,6 +72,7 @@ class AnalysisResult:
     category: str
     lines: list[str] = field(default_factory=list)
     recommendations: list[Recommendation] = field(default_factory=list)
+    missing_tools: list[str] = field(default_factory=list)  # tool names that were unavailable
 
 
 # ---------------------------------------------------------------------------
@@ -715,7 +717,8 @@ def _severity_icon(severity: str) -> str:
 def _format_human(url: str, results: list[AnalysisResult],
                   include_recommendations: bool = True,
                   node_address: str = "",
-                  cpu_cores: Optional[int] = None) -> str:
+                  cpu_cores: Optional[int] = None,
+                  install_suggestions: list | None = None) -> str:
     """Format analysis results for human-readable output.
 
     Separates data gathering from presentation, preserving the clean
@@ -751,6 +754,26 @@ def _format_human(url: str, results: list[AnalysisResult],
                 lines.append(f"   → {rec.action}")
     else:
         lines.append(f"✅ NO RECOMMENDATIONS - {url} LOOKS HEALTHY!")
+
+    # Install suggestions for missing metric tools
+    install_suggestions = install_suggestions or []
+    if install_suggestions:
+        lines.append("")
+        lines.append("=" * 50)
+        lines.append("📦 MISSING TOOL SUGGESTIONS")
+        lines.append("=" * 50)
+        lines.append("")
+        lines.append("The following metric tools were not found on the remote host.")
+        lines.append("Install them for richer data collection:")
+        lines.append("")
+        for sug in install_suggestions:
+            lines.append(f"  🔧 {sug.message}")
+            if sug.detail:
+                lines.append(f"     {sug.detail}")
+            if sug.action:
+                lines.append(f"     → {sug.action}")
+            lines.append("")
+
     lines.append("=" * 50)
 
     return "\n".join(lines)
@@ -759,7 +782,8 @@ def _format_human(url: str, results: list[AnalysisResult],
 def _format_json(url: str, port: int, metrics: dict,
                  results: list[AnalysisResult],
                  include_recommendations: bool = True,
-                 cpu_cores: Optional[int] = None) -> str:
+                 cpu_cores: Optional[int] = None,
+                 install_suggestions: list | None = None) -> str:
     """Format results as JSON."""
     all_recommendations = []
     for r in results:
@@ -797,7 +821,15 @@ def _format_json(url: str, port: int, metrics: dict,
             },
         },
         "recommendations": [],
+        "install_suggestions": [],
+        "missing_tools": [],
     }
+
+    # Collect missing tools from results
+    all_missing_tools = []
+    for r in results:
+        all_missing_tools.extend(r.missing_tools)
+    output["missing_tools"] = all_missing_tools
 
     # Add memory used_pct
     mem_total = metrics.get("node_memory_MemTotal_bytes")
@@ -815,6 +847,17 @@ def _format_json(url: str, port: int, metrics: dict,
                 "message": rec.message,
                 "action": rec.action,
             })
+
+    # Install suggestions
+    install_suggestions = install_suggestions or []
+    for sug in install_suggestions:
+        output["install_suggestions"].append({
+            "tool": sug.metric,
+            "category": sug.category,
+            "message": sug.message,
+            "detail": sug.detail,
+            "action": sug.action,
+        })
 
     return json.dumps(output, indent=2)
 
@@ -922,10 +965,36 @@ def analyze_remote_node(
         ),
     ]
 
-    if json_output:
-        return _format_json(url, port, metrics, results, include_recommendations, cpu_cores=cpu_cores)
+    # Detect missing tools from absent metric groups (node_exporter path)
+    # When node_exporter doesn't expose certain metrics, it often means the
+    # underlying tool isn't available on the remote host.
+    missing_tools = []
+    if not metrics.get("node_cpu_seconds_total") and not metrics.get("node_cpu_idle_pct"):
+        missing_tools.append("node_exporter_cpu")
+    # Note: node_exporter typically provides CPU stats from kernel, not mpstat,
+    # so we don't map to mpstat here. Instead, we note the absence of data.
 
-    return _format_human(url, results, include_recommendations, node_address=node_address, cpu_cores=cpu_cores)
+    # Generate install suggestions from missing tools detected during analysis
+    from linuxdoctor.collectors import MetricCollection
+    missing_collections = []
+    if missing_tools:
+        mc = MetricCollection(category="node_exporter", missing_tools=missing_tools)
+        missing_collections.append(mc)
+
+    # Also check for tools referenced in recommendation actions
+    all_recommendations = []
+    for r in results:
+        all_recommendations.extend(r.recommendations)
+
+    install_suggestions = generate_install_suggestions(
+        missing_collections,
+        recommendations=all_recommendations if include_recommendations else None,
+    )
+
+    if json_output:
+        return _format_json(url, port, metrics, results, include_recommendations, cpu_cores=cpu_cores, install_suggestions=install_suggestions)
+
+    return _format_human(url, results, include_recommendations, node_address=node_address, cpu_cores=cpu_cores, install_suggestions=install_suggestions)
 
 
 def analyze_ssh_node(
@@ -973,9 +1042,10 @@ def analyze_ssh_node(
             return json.dumps({"error": f"SSH connection failed: {message}", "node": node_address, "ssh_connect": ssh_connect}, indent=2)
         return f"Error: SSH connection to {ssh_connect} failed: {message}"
 
-    # Collect metrics via SSH
+    # Collect metrics via SSH (tracking missing tools)
+    ssh_missing_tools: list[str] = []
     try:
-        metrics = collect_ssh_metrics(ssh_connect, allow_interactive=True)
+        metrics = collect_ssh_metrics(ssh_connect, allow_interactive=True, missing_tools=ssh_missing_tools)
     except Exception as e:
         if json_output:
             return json.dumps({"error": f"SSH metric collection failed: {e}", "node": node_address}, indent=2)
@@ -1003,7 +1073,7 @@ def analyze_ssh_node(
         time.sleep(interval)
         try:
             previous_metrics = metrics
-            metrics = collect_ssh_metrics(ssh_connect, allow_interactive=True)
+            metrics = collect_ssh_metrics(ssh_connect, allow_interactive=True, missing_tools=ssh_missing_tools)
         except Exception:
             pass
 
@@ -1022,43 +1092,35 @@ def analyze_ssh_node(
         ),
     ]
 
-    url = f"ssh://{ssh_connect}"
-
-    if json_output:
-        return _format_json(url, port=22, metrics=metrics, results=results,
-                            include_recommendations=include_recommendations, cpu_cores=cpu_cores)
-
-    # Use SSH-specific header in human output
+    # Generate install suggestions from missing tools detected during SSH collection
     all_recommendations = []
     for r in results:
         all_recommendations.extend(r.recommendations)
 
-    lines = []
-    lines.append("🔍 Linux Doctor v0.1.0")
-    lines.append(f"📊 Analyzing SSH host at {ssh_connect} [via SSH]")
-    lines.append("=" * 50)
+    from linuxdoctor.collectors import MetricCollection
+    missing_collections = []
+    if ssh_missing_tools:
+        mc = MetricCollection(category="ssh_collection", missing_tools=ssh_missing_tools)
+        missing_collections.append(mc)
 
-    for r in results:
-        lines.extend(r.lines)
+    install_suggestions = generate_install_suggestions(
+        missing_collections,
+        recommendations=all_recommendations if include_recommendations else None,
+    )
 
+    url = f"ssh://{ssh_connect}"
+
+    if json_output:
+        return _format_json(url, port=22, metrics=metrics, results=results,
+                            include_recommendations=include_recommendations, cpu_cores=cpu_cores,
+                            install_suggestions=install_suggestions)
+
+    # Use SSH-specific header in human output
     severity_order = {"critical": 0, "warning": 1, "info": 2}
     all_recommendations.sort(key=lambda r: severity_order.get(r.severity, 3))
 
-    lines.append("")
-    lines.append("=" * 50)
-    if include_recommendations and all_recommendations:
-        lines.append(f"⚠️  RECOMMENDATIONS FOR {ssh_connect}")
-        lines.append("=" * 50)
-        for i, rec in enumerate(all_recommendations, 1):
-            icon = _severity_icon(rec.severity)
-            lines.append(f"{i}. {icon} [{rec.severity.upper()}] {rec.message}")
-            if rec.action:
-                lines.append(f"   → {rec.action}")
-    else:
-        lines.append(f"✅ NO RECOMMENDATIONS - {ssh_connect} LOOKS HEALTHY!")
-    lines.append("=" * 50)
-
-    return "\n".join(lines)
+    return _format_human(url, results, include_recommendations, node_address=node_address,
+                         cpu_cores=cpu_cores, install_suggestions=install_suggestions)
 
 
 def is_ssh_host(host: str, registry_path: str = DEFAULT_REGISTRY_PATH) -> bool:

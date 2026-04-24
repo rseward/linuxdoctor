@@ -125,7 +125,8 @@ def resolve_ssh_connect(host: str, host_info: Optional[dict] = None) -> str:
 # SSH metric collection — produces Prometheus-compatible dicts
 # ---------------------------------------------------------------------------
 
-def collect_ssh_metrics(ssh_connect: str, allow_interactive: bool = False) -> dict:
+def collect_ssh_metrics(ssh_connect: str, allow_interactive: bool = False,
+                              missing_tools: list | None = None) -> dict:
     """Collect metrics from a remote host via SSH.
 
     Runs traditional perf tools on the remote host and converts the output
@@ -135,33 +136,39 @@ def collect_ssh_metrics(ssh_connect: str, allow_interactive: bool = False) -> di
     Args:
         ssh_connect: SSH connection string.
         allow_interactive: Allow interactive SSH prompts.
+        missing_tools: Optional list to append names of tools that were
+            unavailable on the remote host. If provided, each collection
+            function will append tool names (e.g., 'mpstat', 'iostat') when
+            the remote command fails or is not found.
 
     Returns:
         Dict of metric_name -\u003e value or list of {labels, value} dicts,
         matching the format from parse_metrics().
     """
     metrics = {}
+    if missing_tools is None:
+        missing_tools = []
 
     # CPU metrics via mpstat
-    _collect_ssh_cpu(ssh_connect, metrics, allow_interactive)
+    _collect_ssh_cpu(ssh_connect, metrics, allow_interactive, missing_tools)
 
     # Memory metrics via /proc/meminfo
-    _collect_ssh_memory(ssh_connect, metrics, allow_interactive)
+    _collect_ssh_memory(ssh_connect, metrics, allow_interactive, missing_tools)
 
     # Load averages via /proc/loadavg
-    _collect_ssh_load(ssh_connect, metrics, allow_interactive)
+    _collect_ssh_load(ssh_connect, metrics, allow_interactive, missing_tools)
 
     # Disk usage via df
-    _collect_ssh_disk(ssh_connect, metrics, allow_interactive)
+    _collect_ssh_disk(ssh_connect, metrics, allow_interactive, missing_tools)
 
     # Disk I/O via iostat
-    _collect_ssh_disk_io(ssh_connect, metrics, allow_interactive)
+    _collect_ssh_disk_io(ssh_connect, metrics, allow_interactive, missing_tools)
 
     # Network via /proc/net/dev
-    _collect_ssh_network(ssh_connect, metrics, allow_interactive)
+    _collect_ssh_network(ssh_connect, metrics, allow_interactive, missing_tools)
 
     # Context switches via /proc/stat
-    _collect_ssh_context_switches(ssh_connect, metrics, allow_interactive)
+    _collect_ssh_context_switches(ssh_connect, metrics, allow_interactive, missing_tools)
 
     return metrics
 
@@ -174,10 +181,12 @@ def _parse_prometheus_label_value(value_str: str) -> float:
         return 0.0
 
 
-def _collect_ssh_cpu(ssh_connect: str, metrics: dict, allow_interactive: bool):
+def _collect_ssh_cpu(ssh_connect: str, metrics: dict, allow_interactive: bool,
+                     missing_tools: list):
     """Collect CPU metrics via mpstat on remote host."""
     result = ssh_run(ssh_connect, "mpstat 1 1", timeout=20, allow_interactive=allow_interactive)
     if result.error:
+        missing_tools.append("mpstat")
         return
 
     total_idle = 0.0
@@ -236,7 +245,8 @@ def _collect_ssh_cpu(ssh_connect: str, metrics: dict, allow_interactive: bool):
             metrics["node_cpu_seconds_total"] = cpu_entries
 
 
-def _collect_ssh_memory(ssh_connect: str, metrics: dict, allow_interactive: bool):
+def _collect_ssh_memory(ssh_connect: str, metrics: dict, allow_interactive: bool,
+                         missing_tools: list):
     """Collect memory metrics from /proc/meminfo on remote host."""
     result = ssh_run(ssh_connect, "cat /proc/meminfo", timeout=10, allow_interactive=allow_interactive)
     if result.error:
@@ -262,7 +272,8 @@ def _collect_ssh_memory(ssh_connect: str, metrics: dict, allow_interactive: bool
         metrics["node_memory_MemAvailable_bytes"] = float(available * 1024)
 
 
-def _collect_ssh_load(ssh_connect: str, metrics: dict, allow_interactive: bool):
+def _collect_ssh_load(ssh_connect: str, metrics: dict, allow_interactive: bool,
+                      missing_tools: list):
     """Collect load averages from /proc/loadavg on remote host."""
     result = ssh_run(ssh_connect, "cat /proc/loadavg", timeout=5, allow_interactive=allow_interactive)
     if result.error:
@@ -278,10 +289,12 @@ def _collect_ssh_load(ssh_connect: str, metrics: dict, allow_interactive: bool):
             pass
 
 
-def _collect_ssh_disk(ssh_connect: str, metrics: dict, allow_interactive: bool):
+def _collect_ssh_disk(ssh_connect: str, metrics: dict, allow_interactive: bool,
+                      missing_tools: list):
     """Collect disk usage from df on remote host."""
     result = ssh_run(ssh_connect, "df -B1 --output=source,size,avail,pcent,target", timeout=10, allow_interactive=allow_interactive)
     if result.error:
+        missing_tools.append("df")
         return
 
     size_entries = []
@@ -326,10 +339,12 @@ def _collect_ssh_disk(ssh_connect: str, metrics: dict, allow_interactive: bool):
         metrics["node_filesystem_avail_bytes"] = avail_entries
 
 
-def _collect_ssh_disk_io(ssh_connect: str, metrics: dict, allow_interactive: bool):
+def _collect_ssh_disk_io(ssh_connect: str, metrics: dict, allow_interactive: bool,
+                          missing_tools: list):
     """Collect disk I/O metrics from iostat on remote host."""
     result = ssh_run(ssh_connect, "iostat -dx 1 1", timeout=20, allow_interactive=allow_interactive)
     if result.error:
+        missing_tools.append("iostat")
         return
 
     io_entries = []
@@ -360,7 +375,8 @@ def _collect_ssh_disk_io(ssh_connect: str, metrics: dict, allow_interactive: boo
         metrics["node_disk_io_util_pct"] = io_entries
 
 
-def _collect_ssh_network(ssh_connect: str, metrics: dict, allow_interactive: bool):
+def _collect_ssh_network(ssh_connect: str, metrics: dict, allow_interactive: bool,
+                          missing_tools: list):
     """Collect network metrics from /proc/net/dev on remote host."""
     result = ssh_run(ssh_connect, "cat /proc/net/dev", timeout=10, allow_interactive=allow_interactive)
     if result.error:
@@ -394,7 +410,8 @@ def _collect_ssh_network(ssh_connect: str, metrics: dict, allow_interactive: boo
         metrics["node_network_transmit_bytes_total"] = tx_entries
 
 
-def _collect_ssh_context_switches(ssh_connect: str, metrics: dict, allow_interactive: bool):
+def _collect_ssh_context_switches(ssh_connect: str, metrics: dict, allow_interactive: bool,
+                                  missing_tools: list):
     """Collect context switch count from /proc/stat on remote host."""
     result = ssh_run(ssh_connect, "grep ctxt /proc/stat", timeout=5, allow_interactive=allow_interactive)
     if result.error:
