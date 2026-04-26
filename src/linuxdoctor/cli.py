@@ -233,7 +233,8 @@ def web(bind_host, port, interval, node_port, threshold, registry_path):
 @click.option("--threshold", "-t", default="default", help="Threshold profile: default, strict, or relaxed")
 @click.option("--node-port", "node_port", default=9100, type=int, help="Node exporter port (default: 9100)")
 @click.option("--registry", "registry_path", default=None, help="Path to the host registry YAML file")
-def dashboard(json_output, resample, resample_interval, threshold, node_port, registry_path):
+@click.option("--no-color", "no_color", is_flag=True, help="Disable colored terminal output")
+def dashboard(json_output, resample, resample_interval, threshold, node_port, registry_path, no_color):
     """Print a one-shot health dashboard for all registered hosts.
 
     Scans each registered host and prints a summary table of health
@@ -245,9 +246,13 @@ def dashboard(json_output, resample, resample_interval, threshold, node_port, re
     Use --json for machine-readable output. A progress bar (tqdm) is
     shown during scanning unless --json is specified.
 
+    By default, status values are colorized (green=OK/UP, yellow=WARN,
+    red=CRIT/DOWN). Use --no-color to disable ANSI color output.
+
     Example: linuxdoctor dashboard
     Example: linuxdoctor dashboard --resample
     Example: linuxdoctor dashboard --json
+    Example: linuxdoctor dashboard --no-color
     """
     dashboard_command(
         json_output=json_output,
@@ -256,6 +261,7 @@ def dashboard(json_output, resample, resample_interval, threshold, node_port, re
         threshold=threshold,
         port=node_port,
         registry_path=registry_path,
+        use_color=not no_color,
     )
 
 

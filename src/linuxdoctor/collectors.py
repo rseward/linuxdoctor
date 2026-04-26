@@ -194,6 +194,13 @@ TOOL_PACKAGES: dict[str, dict[str, str]] = {
         "categories": ["io", "load"],
         "metrics": ["kernel messages"],
     },
+    # SMART disk health
+    "smartctl": {
+        "dnf": "smartmontools", "apt_get": "smartmontools",
+        "description": "SMART disk health monitoring and diagnostics",
+        "categories": ["smart"],
+        "metrics": ["smart_*_overall_health", "smart_*_reallocated_sectors", "smart_*_pending_sectors", "smart_*_temperature"],
+    },
 }
 
 
@@ -816,6 +823,239 @@ def collect_sar_metrics() -> MetricCollection:
 
 
 # ---------------------------------------------------------------------------
+# SMART Disk Health Collectors
+# ---------------------------------------------------------------------------
+
+def _smartctl_scan_devices() -> list[str]:
+    """Scan for disks using smartctl --scan and return device paths."""
+    stdout, err = _run_command(["smartctl", "--scan"], timeout=10)
+    if err:
+        return []
+    devices = []
+    for line in stdout.strip().splitlines():
+        parts = line.split()
+        if parts:
+            devices.append(parts[0])
+    return devices
+
+
+def _parse_smart_attributes(output: str) -> dict[str, dict]:
+    """Parse smartctl -A output into a dict of attribute dicts.
+
+    Returns a dict keyed by attribute name, each value being:
+        {"id": int, "value": int, "worst": int, "thresh": int, "raw": int, "when_failed": str}
+    """
+    attrs = {}
+    in_attrs = False
+    for line in output.splitlines():
+        # Header line typically starts with ID# or similar
+        if line.strip().startswith("ID#") or ("ATTRIBUTE_NAME" in line and "RAW_VALUE" in line):
+            in_attrs = True
+            continue
+        if not in_attrs:
+            continue
+        # Blank line or non-data line ends the attributes section
+        if not line.strip() or line.startswith("#"):
+            continue
+        # Parse data lines: ID# ATTRIBUTE_NAME FLAG VALUE WORST THRESH TYPE UPDATED WHEN_FAILED RAW_VALUE
+        parts = line.split()
+        if len(parts) >= 10:
+            try:
+                attr_id = int(parts[0])
+                attr_name = parts[1]
+                attr_value = int(parts[3])
+                attr_worst = int(parts[4])
+                attr_thresh = int(parts[5])
+                raw_str = parts[9]
+                # Raw value may have additional text; take just the number
+                raw_val = int(raw_str) if raw_str.isdigit() else 0
+                when_failed = parts[8] if len(parts) > 8 else "-"
+                attrs[attr_name] = {
+                    "id": attr_id,
+                    "value": attr_value,
+                    "worst": attr_worst,
+                    "thresh": attr_thresh,
+                    "raw": raw_val,
+                    "when_failed": when_failed,
+                }
+            except (ValueError, IndexError):
+                continue
+    return attrs
+
+
+def collect_smart_metrics() -> MetricCollection:
+    """Collect SMART disk health metrics using smartctl.
+
+    Scans for disks and reports overall health status, critical SMART
+    attributes (reallocated sectors, pending sectors, uncorrectable sectors,
+    temperature), and flags any pre-failure or failing attributes.
+    """
+    collection = MetricCollection(category="smart")
+
+    if not _tool_available("smartctl"):
+        collection.missing_tools.append("smartctl")
+        collection.metrics.append(MetricResult(
+            name="smart_available", value=False, source="smartctl",
+            error="smartctl (smartmontools) not installed"
+        ))
+        return collection
+
+    collection.metrics.append(MetricResult(
+        name="smart_available", value=True, source="smartctl"
+    ))
+
+    # Scan for devices
+    devices = _smartctl_scan_devices()
+    if not devices:
+        # Fallback: try common device paths
+        import os
+        fallback_devices = []
+        for dev in ["/dev/sda", "/dev/sdb", "/dev/nvme0n1", "/dev/nvme1n1"]:
+            if os.path.exists(dev):
+                fallback_devices.append(dev)
+        if fallback_devices:
+            devices = fallback_devices
+        else:
+            collection.metrics.append(MetricResult(
+                name="smart_devices_found", value=0, source="smartctl",
+                error="No block devices found for SMART scanning"
+            ))
+            return collection
+
+    collection.metrics.append(MetricResult(
+        name="smart_devices_found", value=len(devices), source="smartctl"
+    ))
+
+    for device in devices:
+        # Create a safe metric name from device path
+        # /dev/sda -> sda, /dev/nvme0n1 -> nvme0n1
+        safe_name = device.replace("/dev/", "").replace("/", "_")
+
+        # Check overall health status: smartctl -H <device>
+        stdout, err = _run_command(["smartctl", "-H", device], timeout=15)
+        if err and not stdout:
+            collection.metrics.append(MetricResult(
+                name=f"smart_{safe_name}_health", value="unknown", source="smartctl -H",
+                raw_output=err, error=f"smartctl -H failed for {device}: {err}"
+            ))
+            continue
+
+        # Parse health status
+        # Typical output:
+        #   SMART overall-health self-assessment test result: PASSED
+        #   or: SMART Health Status: OK
+        health_status = "unknown"
+        combined = f"{stdout}\n{err}".strip() if err else stdout.strip()
+        for line in combined.splitlines():
+            lower = line.lower()
+            if "passed" in lower or "ok" in lower:
+                health_status = "passed"
+                break
+            elif "failed" in lower or "failing" in lower or "failure" in lower:
+                health_status = "failed"
+                break
+
+        # Map health status to a numeric value for easier threshold checking:
+        # passed=0, warning=1, failed=2, unknown=3
+        health_map = {"passed": 0, "warning": 1, "failed": 2, "unknown": 3}
+        collection.metrics.append(MetricResult(
+            name=f"smart_{safe_name}_health",
+            value=health_status,
+            source="smartctl -H",
+            raw_output=combined
+        ))
+        collection.metrics.append(MetricResult(
+            name=f"smart_{safe_name}_health_code",
+            value=health_map.get(health_status, 3),
+            source="smartctl -H"
+        ))
+
+        # Collect key SMART attributes: smartctl -A <device>
+        stdout, err = _run_command(["smartctl", "-A", device], timeout=15)
+        if err and not stdout:
+            # Attributes not available (e.g., NVMe devices may not support -A)
+            continue
+
+        attrs = _parse_smart_attributes(stdout)
+
+        # Key attributes to track (standardized names, case-sensitive)
+        key_attrs = {
+            "Reallocated_Sector_Ct": f"smart_{safe_name}_reallocated_sectors",
+            "Reallocated_Sector": f"smart_{safe_name}_reallocated_sectors",
+            "Pending_Sector_Ct": f"smart_{safe_name}_pending_sectors",
+            "Current_Pending_Sector": f"smart_{safe_name}_pending_sectors",
+            "Offline_Uncorrectable": f"smart_{safe_name}_uncorrectable_sectors",
+            "Offline_Uncorrectable_Ct": f"smart_{safe_name}_uncorrectable_sectors",
+            "Reported_Uncorrect": f"smart_{safe_name}_uncorrectable_sectors",
+            "Reported_Uncorrectable": f"smart_{safe_name}_uncorrectable_sectors",
+            "Temperature_Celsius": f"smart_{safe_name}_temperature",
+            "Temperature": f"smart_{safe_name}_temperature",
+            "Airflow_Temperature_Cel": f"smart_{safe_name}_temperature",
+            "Temperature_Case": f"smart_{safe_name}_temperature",
+            "Spin_Retry_Count": f"smart_{safe_name}_spin_retries",
+            "Spin_Up_Retry_Count": f"smart_{safe_name}_spin_retries",
+            "Runtime_Bad_Block": f"smart_{safe_name}_bad_blocks",
+            "End_to_End_Error": f"smart_{safe_name}_e2e_errors",
+            "SSD_Life_Left": f"smart_{safe_name}_ssd_life_left",
+            "Percent_Life_Remaining": f"smart_{safe_name}_ssd_life_left",
+            "Wear_Leveling_Count": f"smart_{safe_name}_wear_leveling",
+            "Media_Wearout_Indicator": f"smart_{safe_name}_wear_leveling",
+            "Power_On_Hours": f"smart_{safe_name}_power_on_hours",
+        }
+
+        reported_metrics = set()
+        for attr_name, attr_data in attrs.items():
+            if attr_name in key_attrs:
+                metric_name = key_attrs[attr_name]
+                # Avoid duplicate metric names (some attribute names map to same metric)
+                if metric_name in reported_metrics:
+                    continue
+                reported_metrics.add(metric_name)
+
+                # For temperature, use the raw value (actual temp in Celsius)
+                # For others, use the raw value (count)
+                if "temperature" in metric_name:
+                    collection.metrics.append(MetricResult(
+                        name=metric_name,
+                        value=attr_data["raw"],
+                        unit="°C",
+                        source=f"smartctl -A {device}"
+                    ))
+                elif "ssd_life_left" in metric_name or "wear_leveling" in metric_name:
+                    collection.metrics.append(MetricResult(
+                        name=metric_name,
+                        value=attr_data["value"],  # normalized percentage
+                        unit="%",
+                        source=f"smartctl -A {device}"
+                    ))
+                elif "power_on_hours" in metric_name:
+                    collection.metrics.append(MetricResult(
+                        name=metric_name,
+                        value=attr_data["raw"],
+                        unit="h",
+                        source=f"smartctl -A {device}"
+                    ))
+                else:
+                    # Sector/error counts use raw value
+                    collection.metrics.append(MetricResult(
+                        name=metric_name,
+                        value=attr_data["raw"],
+                        source=f"smartctl -A {device}"
+                    ))
+
+                # Flag if the attribute is in a pre-failure or failing state
+                if attr_data.get("when_failed", "-") != "-":
+                    collection.metrics.append(MetricResult(
+                        name=f"{metric_name}_failed",
+                        value=attr_data["when_failed"],
+                        source=f"smartctl -A {device}",
+                        error=f"SMART attribute {attr_name} is in {attr_data['when_failed']} state"
+                    ))
+
+    return collection
+
+
+# ---------------------------------------------------------------------------
 # Main collection entry point
 # ---------------------------------------------------------------------------
 
@@ -827,6 +1067,7 @@ ALL_COLLECTORS = {
     "network": collect_network_metrics,
     "load": collect_load_metrics,
     "sar": collect_sar_metrics,
+    "smart": collect_smart_metrics,
 }
 
 

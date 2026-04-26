@@ -9,6 +9,7 @@ from linuxdoctor.recommendations import (
     recommend_memory,
     recommend_disk,
     recommend_io,
+    recommend_smart,
     _mount_key_to_path,
 )
 
@@ -330,3 +331,173 @@ class TestInstallSuggestions:
         )
         recs = generate_install_suggestions([coll])
         assert len(recs) == 2  # Two separate suggestions
+
+
+class TestSmartRecommendations:
+    """Tests for SMART disk health recommendation generation."""
+
+    def _default_thresholds(self):
+        return {
+            "smart_reallocated_sectors": 10,
+            "smart_pending_sectors": 5,
+            "smart_uncorrectable_sectors": 1,
+            "smart_temperature_c": 55,
+            "smart_ssd_life_pct": 20,
+        }
+
+    def test_smart_health_failed(self):
+        """A disk with SMART health FAILED should generate a critical recommendation."""
+        collection = _make_collection("smart", [
+            ("smart_available", True, "", "smartctl"),
+            ("smart_sda_health", "failed", "", "smartctl -H"),
+            ("smart_sda_health_code", 2, "", "smartctl -H"),
+        ])
+        recs = recommend_smart([collection], self._default_thresholds())
+        assert len(recs) >= 1
+        critical = [r for r in recs if r.severity == "critical"]
+        assert any("FAILED" in r.message for r in critical)
+
+    def test_smart_health_passed_no_recs(self):
+        """A disk with SMART health PASSED and no bad attributes should generate no recommendations."""
+        collection = _make_collection("smart", [
+            ("smart_available", True, "", "smartctl"),
+            ("smart_sda_health", "passed", "", "smartctl -H"),
+            ("smart_sda_health_code", 0, "", "smartctl -H"),
+            ("smart_sda_reallocated_sectors", 0, "", "smartctl -A"),
+            ("smart_sda_pending_sectors", 0, "", "smartctl -A"),
+            ("smart_sda_uncorrectable_sectors", 0, "", "smartctl -A"),
+        ])
+        recs = recommend_smart([collection], self._default_thresholds())
+        assert len(recs) == 0
+
+    def test_smart_reallocated_sectors_critical(self):
+        """High reallocated sectors should generate a critical recommendation."""
+        collection = _make_collection("smart", [
+            ("smart_available", True, "", "smartctl"),
+            ("smart_sda_health", "passed", "", "smartctl -H"),
+            ("smart_sda_health_code", 0, "", "smartctl -H"),
+            ("smart_sda_reallocated_sectors", 50, "", "smartctl -A"),
+        ])
+        recs = recommend_smart([collection], self._default_thresholds())
+        assert len(recs) >= 1
+        assert any("reallocated" in r.message for r in recs)
+        assert any(r.severity == "critical" for r in recs)
+
+    def test_smart_reallocated_sectors_warning_low_count(self):
+        """A few reallocated sectors (above 0 but below critical threshold) should be a warning."""
+        collection = _make_collection("smart", [
+            ("smart_available", True, "", "smartctl"),
+            ("smart_sda_health", "passed", "", "smartctl -H"),
+            ("smart_sda_health_code", 0, "", "smartctl -H"),
+            ("smart_sda_reallocated_sectors", 2, "", "smartctl -A"),
+        ])
+        recs = recommend_smart([collection], self._default_thresholds())
+        assert any("reallocated" in r.message for r in recs)
+        assert any(r.severity == "warning" for r in recs)
+
+    def test_smart_pending_sectors_critical(self):
+        """High pending sectors should generate a critical recommendation."""
+        collection = _make_collection("smart", [
+            ("smart_available", True, "", "smartctl"),
+            ("smart_sda_health", "passed", "", "smartctl -H"),
+            ("smart_sda_health_code", 0, "", "smartctl -H"),
+            ("smart_sda_pending_sectors", 20, "", "smartctl -A"),
+        ])
+        recs = recommend_smart([collection], self._default_thresholds())
+        assert len(recs) >= 1
+        assert any("pending" in r.message for r in recs)
+
+    def test_smart_uncorrectable_sectors_critical(self):
+        """Any uncorrectable sectors should generate a critical recommendation."""
+        collection = _make_collection("smart", [
+            ("smart_available", True, "", "smartctl"),
+            ("smart_sda_health", "passed", "", "smartctl -H"),
+            ("smart_sda_health_code", 0, "", "smartctl -H"),
+            ("smart_sda_uncorrectable_sectors", 5, "", "smartctl -A"),
+        ])
+        recs = recommend_smart([collection], self._default_thresholds())
+        assert len(recs) >= 1
+        assert any("uncorrectable" in r.message for r in recs)
+        assert any(r.severity == "critical" for r in recs)
+
+    def test_smart_temperature_warning(self):
+        """High disk temperature should generate a warning."""
+        collection = _make_collection("smart", [
+            ("smart_available", True, "", "smartctl"),
+            ("smart_sda_health", "passed", "", "smartctl -H"),
+            ("smart_sda_health_code", 0, "", "smartctl -H"),
+            ("smart_sda_temperature", 60, "\u00b0C", "smartctl -A"),
+        ])
+        recs = recommend_smart([collection], self._default_thresholds())
+        assert len(recs) >= 1
+        assert any("temperature" in r.message for r in recs)
+
+    def test_smart_ssd_life_critical(self):
+        """Low SSD life remaining should generate a critical recommendation."""
+        collection = _make_collection("smart", [
+            ("smart_available", True, "", "smartctl"),
+            ("smart_sda_health", "passed", "", "smartctl -H"),
+            ("smart_sda_health_code", 0, "", "smartctl -H"),
+            ("smart_sda_ssd_life_left", 5, "%", "smartctl -A"),
+        ])
+        recs = recommend_smart([collection], self._default_thresholds())
+        assert len(recs) >= 1
+        assert any("life" in r.message for r in recs)
+        assert any(r.severity == "critical" for r in recs)
+
+    def test_smart_ssd_life_warning(self):
+        """SSD life approaching threshold should generate a warning."""
+        collection = _make_collection("smart", [
+            ("smart_available", True, "", "smartctl"),
+            ("smart_sda_health", "passed", "", "smartctl -H"),
+            ("smart_sda_health_code", 0, "", "smartctl -H"),
+            ("smart_sda_ssd_life_left", 25, "%", "smartctl -A"),
+        ])
+        recs = recommend_smart([collection], self._default_thresholds())
+        assert any("life" in r.message for r in recs)
+
+    def test_smart_spin_retries_warning(self):
+        """Spin retries > 0 should generate a warning."""
+        collection = _make_collection("smart", [
+            ("smart_available", True, "", "smartctl"),
+            ("smart_sda_health", "passed", "", "smartctl -H"),
+            ("smart_sda_health_code", 0, "", "smartctl -H"),
+            ("smart_sda_spin_retries", 3, "", "smartctl -A"),
+        ])
+        recs = recommend_smart([collection], self._default_thresholds())
+        assert any("spin" in r.message for r in recs)
+
+    def test_smart_not_available(self):
+        """When smartctl is not available, no recommendations should be generated."""
+        collection = _make_collection("smart", [
+            ("smart_available", False, "", "smartctl"),
+        ])
+        recs = recommend_smart([collection], self._default_thresholds())
+        assert len(recs) == 0
+
+    def test_smart_install_suggestion(self):
+        """When smartctl is missing, install suggestions should include smartmontools."""
+        from linuxdoctor.collectors import MetricCollection as MC
+        coll = MC(category="smart", missing_tools=["smartctl"])
+        recs = generate_install_suggestions([coll])
+        assert len(recs) >= 1
+        smart_recs = [r for r in recs if r.metric == "smartctl"]
+        assert len(smart_recs) == 1
+        assert "smartmontools" in smart_recs[0].action
+
+    def test_smart_multiple_devices(self):
+        """SMART metrics for multiple devices should generate separate recommendations."""
+        collection = _make_collection("smart", [
+            ("smart_available", True, "", "smartctl"),
+            ("smart_sda_health", "passed", "", "smartctl -H"),
+            ("smart_sda_health_code", 0, "", "smartctl -H"),
+            ("smart_sda_reallocated_sectors", 50, "", "smartctl -A"),
+            ("smart_sdb_health", "failed", "", "smartctl -H"),
+            ("smart_sdb_health_code", 2, "", "smartctl -H"),
+        ])
+        recs = recommend_smart([collection], self._default_thresholds())
+        # Should have recs for both devices
+        sda_recs = [r for r in recs if "sda" in r.message]
+        sdb_recs = [r for r in recs if "sdb" in r.message]
+        assert len(sda_recs) >= 1
+        assert len(sdb_recs) >= 1

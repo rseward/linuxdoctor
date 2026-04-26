@@ -40,6 +40,11 @@ THRESHOLDS = {
         "io_util_pct": 90,
         "process_blocked": 5,
         "hugepages_waste_pct": 50,
+        "smart_reallocated_sectors": 10,
+        "smart_pending_sectors": 5,
+        "smart_uncorrectable_sectors": 1,
+        "smart_temperature_c": 55,
+        "smart_ssd_life_pct": 20,
     },
     "strict": {
         "cpu_usage_pct": 70,
@@ -54,6 +59,11 @@ THRESHOLDS = {
         "io_util_pct": 75,
         "process_blocked": 2,
         "hugepages_waste_pct": 30,
+        "smart_reallocated_sectors": 1,
+        "smart_pending_sectors": 1,
+        "smart_uncorrectable_sectors": 0,
+        "smart_temperature_c": 45,
+        "smart_ssd_life_pct": 30,
     },
     "relaxed": {
         "cpu_usage_pct": 95,
@@ -68,6 +78,11 @@ THRESHOLDS = {
         "io_util_pct": 98,
         "process_blocked": 10,
         "hugepages_waste_pct": 70,
+        "smart_reallocated_sectors": 100,
+        "smart_pending_sectors": 50,
+        "smart_uncorrectable_sectors": 10,
+        "smart_temperature_c": 65,
+        "smart_ssd_life_pct": 10,
     },
 }
 
@@ -455,6 +470,197 @@ def recommend_load(collections: list, thresholds: dict) -> list[Recommendation]:
 # Main recommendation engine
 # ---------------------------------------------------------------------------
 
+def recommend_smart(collections: list, thresholds: dict) -> list[Recommendation]:
+    """Generate SMART disk health recommendations."""
+    recs = []
+
+    # Check if SMART collection is available
+    smart_available = _find_metric(collections, "smart", "smart_available")
+    if smart_available is False or smart_available is None:
+        return recs
+
+    # Find all SMART metrics grouped by device
+    smart_metrics = _find_metrics_matching(collections, "smart", "smart_")
+
+    # Group metrics by device
+    devices = {}
+    for name, value in smart_metrics.items():
+        # smart_sda_health -> sda
+        # smart_nvme0n1_health -> nvme0n1
+        # Skip non-device metrics
+        if name in ("smart_available", "smart_devices_found"):
+            continue
+        parts = name.split("_", 2)  # smart, device, rest
+        if len(parts) >= 3:
+            device = parts[1]
+            metric = "_".join(parts[2:])
+            if device not in devices:
+                devices[device] = {}
+            devices[device][metric] = value
+
+    for device, metrics in devices.items():
+        device_path = f"/dev/{device}"
+
+        # Check overall health
+        health = metrics.get("health")
+        if health is not None:
+            if health == "failed":
+                recs.append(Recommendation(
+                    category="smart", severity="critical",
+                    metric=f"smart_{device}_health",
+                    message=f"Disk {device_path} SMART health: FAILED",
+                    detail="The disk has failed its SMART self-assessment. "
+                           "Data loss is imminent. Back up data immediately and replace the drive.",
+                    action=f"Back up critical data NOW. Schedule disk replacement. "
+                           f"Run `smartctl -a {device_path}` for full details."
+                ))
+            elif health == "unknown":
+                recs.append(Recommendation(
+                    category="smart", severity="info",
+                    metric=f"smart_{device}_health",
+                    message=f"Disk {device_path} SMART health status could not be determined",
+                    detail="SMART health check returned an inconclusive result. "
+                           "This may require root/sudo access or the device may not support SMART.",
+                    action=f"Run `sudo smartctl -a {device_path}` manually for details."
+                ))
+
+        # Check health code (0=passed, 1=warning, 2=failed, 3=unknown)
+        health_code = metrics.get("health_code")
+        if health_code is not None and health_code == 1:
+            recs.append(Recommendation(
+                category="smart", severity="warning",
+                metric=f"smart_{device}_health_code",
+                message=f"Disk {device_path} SMART health: WARNING",
+                detail="The disk has issued a SMART warning. It may still be functioning "
+                       "but is showing signs of degradation.",
+                action=f"Run `smartctl -a {device_path}` for details. Plan for replacement."
+            ))
+
+        # Reallocated sectors (sectors remapped to spare area)
+        reallocated = metrics.get("reallocated_sectors")
+        if reallocated is not None:
+            if reallocated > thresholds["smart_reallocated_sectors"]:
+                recs.append(Recommendation(
+                    category="smart", severity="critical",
+                    metric=f"smart_{device}_reallocated_sectors",
+                    message=f"Disk {device_path} has {reallocated} reallocated sectors (threshold: {thresholds['smart_reallocated_sectors']})",
+                    detail="Reallocated sectors indicate the disk is remapping bad sectors to spares. "
+                           "This is a strong predictor of impending disk failure.",
+                    action=f"Back up data and plan disk replacement. Run `smartctl -a {device_path}` for details."
+                ))
+            elif reallocated > 0:
+                recs.append(Recommendation(
+                    category="smart", severity="warning",
+                    metric=f"smart_{device}_reallocated_sectors",
+                    message=f"Disk {device_path} has {reallocated} reallocated sectors",
+                    detail="Some sectors have been remapped. Monitor for growth.",
+                    action=f"Monitor with `smartctl -A {device_path}`. Back up data proactively."
+                ))
+
+        # Pending sectors (sectors awaiting remapping)
+        pending = metrics.get("pending_sectors")
+        if pending is not None:
+            if pending > thresholds["smart_pending_sectors"]:
+                recs.append(Recommendation(
+                    category="smart", severity="critical",
+                    metric=f"smart_{device}_pending_sectors",
+                    message=f"Disk {device_path} has {pending} pending sectors (threshold: {thresholds['smart_pending_sectors']})",
+                    detail="Pending sectors are unreadable and awaiting rewrite/remapping. "
+                           "High counts indicate surface degradation.",
+                    action=f"Back up data immediately. Run `smartctl -a {device_path}` for full SMART report."
+                ))
+            elif pending > 0:
+                recs.append(Recommendation(
+                    category="smart", severity="warning",
+                    metric=f"smart_{device}_pending_sectors",
+                    message=f"Disk {device_path} has {pending} pending sectors",
+                    detail="Pending sectors indicate potential bad spots on the disk.",
+                    action=f"Monitor with `smartctl -A {device_path}`. Consider proactive replacement."
+                ))
+
+        # Uncorrectable sectors
+        uncorrectable = metrics.get("uncorrectable_sectors")
+        if uncorrectable is not None:
+            if uncorrectable > thresholds["smart_uncorrectable_sectors"]:
+                recs.append(Recommendation(
+                    category="smart", severity="critical",
+                    metric=f"smart_{device}_uncorrectable_sectors",
+                    message=f"Disk {device_path} has {uncorrectable} uncorrectable sectors (threshold: {thresholds['smart_uncorrectable_sectors']})",
+                    detail="Uncorrectable sectors cannot be recovered by the drive's ECC. "
+                           "This indicates data loss is occurring.",
+                    action=f"Replace the disk. Run `smartctl -a {device_path}` for details."
+                ))
+            elif uncorrectable > 0:
+                recs.append(Recommendation(
+                    category="smart", severity="warning",
+                    metric=f"smart_{device}_uncorrectable_sectors",
+                    message=f"Disk {device_path} has {uncorrectable} uncorrectable sectors",
+                    detail="Some sectors cannot be corrected. Monitor closely.",
+                    action=f"Run `smartctl -a {device_path}` and check for growing counts."
+                ))
+
+        # Temperature
+        temp = metrics.get("temperature")
+        if temp is not None:
+            if temp > thresholds["smart_temperature_c"]:
+                recs.append(Recommendation(
+                    category="smart", severity="warning",
+                    metric=f"smart_{device}_temperature",
+                    message=f"Disk {device_path} temperature is {temp}°C (threshold: {thresholds['smart_temperature_c']}°C)",
+                    detail="High disk temperatures reduce lifespan and increase error rates.",
+                    action=f"Check cooling: ensure adequate airflow. Monitor with `smartctl -A {device_path}`."
+                ))
+
+        # SSD life remaining
+        ssd_life = metrics.get("ssd_life_left")
+        if ssd_life is not None:
+            if ssd_life < thresholds["smart_ssd_life_pct"]:
+                recs.append(Recommendation(
+                    category="smart", severity="critical",
+                    metric=f"smart_{device}_ssd_life_left",
+                    message=f"SSD {device_path} has {ssd_life}% life remaining (threshold: {thresholds['smart_ssd_life_pct']}%)",
+                    detail="The SSD is approaching its write endurance limit. "
+                           "Plan for replacement before it becomes read-only.",
+                    action=f"Back up data and order a replacement SSD. Run `smartctl -a {device_path}` for details."
+                ))
+            elif ssd_life < thresholds["smart_ssd_life_pct"] + 10:
+                recs.append(Recommendation(
+                    category="smart", severity="warning",
+                    metric=f"smart_{device}_ssd_life_left",
+                    message=f"SSD {device_path} has {ssd_life}% life remaining",
+                    detail="SSD write endurance is declining. Plan for eventual replacement.",
+                    action=f"Monitor with `smartctl -A {device_path}`. Order replacement SSD proactively."
+                ))
+
+        # Spin retries (HDD)
+        spin_retries = metrics.get("spin_retries")
+        if spin_retries is not None and spin_retries > 0:
+            recs.append(Recommendation(
+                category="smart", severity="warning",
+                metric=f"smart_{device}_spin_retries",
+                message=f"Disk {device_path} has {spin_retries} spin retry events",
+                detail="Spin retries indicate the drive had trouble spinning up. "
+                       "This can be an early sign of mechanical failure on HDDs.",
+                action=f"Monitor with `smartctl -a {device_path}`. Consider replacing if retries increase."
+            ))
+
+        # Any attribute in a failing state
+        for metric_name, value in metrics.items():
+            if metric_name.endswith("_failed") and value != "-":
+                base_metric = metric_name.replace("_failed", "")
+                recs.append(Recommendation(
+                    category="smart", severity="critical",
+                    metric=f"smart_{device}_{metric_name}",
+                    message=f"Disk {device_path}: SMART attribute {base_metric} is in {value} state",
+                    detail=f"A SMART attribute has entered a pre-failure or failing state. "
+                           f"The drive may be degrading.",
+                    action=f"Run `smartctl -a {device_path}` for a complete SMART report. "
+                           f"Back up data and plan for drive replacement."
+                ))
+
+    return recs
+
+
 RECOMMENDATION_GENERATORS = {
     "cpu": recommend_cpu,
     "memory": recommend_memory,
@@ -462,6 +668,7 @@ RECOMMENDATION_GENERATORS = {
     "io": recommend_io,
     "network": recommend_network,
     "load": recommend_load,
+    "smart": recommend_smart,
 }
 
 

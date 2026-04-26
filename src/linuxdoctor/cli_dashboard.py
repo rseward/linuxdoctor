@@ -9,6 +9,10 @@ then exits. Use --resample to take two samples (spaced by
 
 Use --json for machine-readable output. A tqdm progress bar is shown
 during scanning unless --json is specified.
+
+Terminal colors are enabled by default. Use --no-color to disable
+ANSI color output (e.g. when piping to a file or on terminals
+without color support).
 """
 
 import json
@@ -33,6 +37,35 @@ from linuxdoctor.web import (
 # Health icon mapping (terminal-friendly)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# ANSI color codes for terminal output
+# ---------------------------------------------------------------------------
+
+ANSI_RESET = "\033[0m"
+ANSI_BOLD = "\033[1m"
+ANSI_GREEN = "\033[32m"
+ANSI_YELLOW = "\033[33m"
+ANSI_RED = "\033[31m"
+ANSI_GRAY = "\033[90m"
+ANSI_BOLD_GREEN = "\033[1;32m"
+ANSI_BOLD_YELLOW = "\033[1;33m"
+ANSI_BOLD_RED = "\033[1;31m"
+
+# Map health status to ANSI color
+_HEALTH_COLOR = {
+    "healthy": ANSI_GREEN,
+    "warning": ANSI_YELLOW,
+    "critical": ANSI_RED,
+    "unknown": ANSI_GRAY,
+}
+
+# Map overall status (UP/DOWN) to ANSI color
+_STATUS_COLOR = {
+    "UP": ANSI_BOLD_GREEN,
+    "DOWN": ANSI_BOLD_RED,
+}
+
+
 _HEALTH_ICONS = {
     "healthy": "✅",
     "warning": "⚠️ ",
@@ -56,6 +89,52 @@ def _health_icon(status: str) -> str:
 def _health_text(status: str) -> str:
     """Return a short text label for a health status."""
     return _HEALTH_TEXT.get(status, "??")
+
+
+def _colorize(text: str, color_code: str, use_color: bool = True) -> str:
+    """Wrap text in ANSI color codes if use_color is True."""
+    if not use_color:
+        return text
+    return f"{color_code}{text}{ANSI_RESET}"
+
+
+def _colorize_health(status_text: str, health_status: str, use_color: bool = True) -> str:
+    """Colorize a health text label based on its status.
+
+    Args:
+        status_text: The text to colorize (e.g. 'OK', 'WARN', 'CRIT').
+        health_status: The health status key ('healthy', 'warning', 'critical', 'unknown').
+        use_color: If False, return text without ANSI codes.
+    """
+    color = _HEALTH_COLOR.get(health_status)
+    if color and use_color:
+        return f"{color}{status_text}{ANSI_RESET}"
+    return status_text
+
+
+def _colorize_status(status_text: str, use_color: bool = True) -> str:
+    """Colorize an overall status (UP/DOWN)."""
+    color = _STATUS_COLOR.get(status_text)
+    if color and use_color:
+        return f"{color}{status_text}{ANSI_RESET}"
+    return status_text
+
+
+def _center_col(colored_text: str, visible_width: int, col_width: int) -> str:
+    """Center-align a string that may contain ANSI escape codes.
+
+    Args:
+        colored_text: The text (possibly with ANSI codes) to center.
+        visible_width: The number of visible (non-ANSI) characters.
+        col_width: The total column width to center within.
+
+    Returns:
+        The centered string, padded with spaces on left and right.
+    """
+    total_pad = col_width - visible_width
+    left_pad = total_pad // 2
+    right_pad = total_pad - left_pad
+    return f"{' ' * left_pad}{colored_text}{' ' * right_pad}"
 
 
 # ---------------------------------------------------------------------------
@@ -135,10 +214,14 @@ def scan_hosts_for_dashboard(
 # Table rendering
 # ---------------------------------------------------------------------------
 
-def _render_table(results: list[HostHealth]) -> str:
+def _render_table(results: list[HostHealth], use_color: bool = True) -> str:
     """Render health results as a terminal table.
 
     Columns: Host | CPU | Context | I/O Wait | Disk | Status
+
+    Args:
+        results: List of HostHealth objects to render.
+        use_color: If True, apply ANSI color codes to status text.
     """
     if not results:
         return "No hosts to scan. Register hosts with: linuxdoctor registerhost HOST"
@@ -177,9 +260,9 @@ def _render_table(results: list[HostHealth]) -> str:
 
     for r in results:
         if r.reachable:
-            status_str = "UP"
+            status_str = _colorize_status("UP", use_color)
         else:
-            status_str = "DOWN"
+            status_str = _colorize_status("DOWN", use_color)
 
         # Host column: show SSH badge if applicable
         if r.collection_method == "ssh":
@@ -187,25 +270,77 @@ def _render_table(results: list[HostHealth]) -> str:
         else:
             host_display = r.host
 
-        # Health columns
-        cpu = _health_text(r.cpu_health)
-        ctx = _health_text(r.context_health)
-        io = _health_text(r.io_wait_health)
-        disk = _health_text(r.disk_health)
+        # Health columns — colorize based on status
+        cpu = _colorize_health(_health_text(r.cpu_health), r.cpu_health, use_color)
+        ctx = _colorize_health(_health_text(r.context_health), r.context_health, use_color)
+        io = _colorize_health(_health_text(r.io_wait_health), r.io_wait_health, use_color)
+        disk = _colorize_health(_health_text(r.disk_health), r.disk_health, use_color)
 
-        row = "| {:<{hw}} | {:^{cw}} | {:^{cw}} | {:^{cw}} | {:^{cw}} | {:^{sw}} |".format(
-            host_display, cpu, ctx, io, disk, status_str,
-            hw=host_w, cw=col_w, sw=status_w,
-        )
+        # Note: When color is active, ANSI codes make strings wider than
+        # visible chars, so we format using the plain (uncolored) widths
+        # for column alignment. We use the plain text for width calculation
+        # and build the row manually to preserve alignment.
+        if use_color:
+            # Build row with colored values — pad based on visible width
+            cpu_plain = _health_text(r.cpu_health)
+            ctx_plain = _health_text(r.context_health)
+            io_plain = _health_text(r.io_wait_health)
+            disk_plain = _health_text(r.disk_health)
+            status_plain = "UP" if r.reachable else "DOWN"
+
+            row = "| {:<{hw}} | {:^{cw}} | {:^{cw}} | {:^{cw}} | {:^{cw}} | {:^{sw}} |".format(
+                host_display, cpu_plain, ctx_plain, io_plain, disk_plain, status_plain,
+                hw=host_w, cw=col_w, sw=status_w,
+            )
+            # Now replace the plain values with colored versions
+            # This is safe because each plain value appears exactly once in the row
+            # We replace from left to right, longest first to avoid partial matches
+            # The Status column value is right-padded; find and replace it carefully
+
+            # Replace in reverse order of appearance to preserve positions
+            # Status column is the last formatted value
+            # We need to handle the padding — find the plain text in the row
+            # and replace with colored version
+
+            # Safer approach: rebuild the row piece by piece
+            host_pad = host_w
+            # Calculate visible widths for centering
+            cpu_vis = len(cpu_plain)
+            ctx_vis = len(ctx_plain)
+            io_vis = len(io_plain)
+            disk_vis = len(disk_plain)
+            status_vis = len(status_plain)
+
+            # Build left-aligned host col
+            host_col = f"{host_display:<{host_pad}}"
+            # Build center-aligned cols
+            cpu_col = _center_col(cpu, cpu_vis, col_w)
+            ctx_col = _center_col(ctx, ctx_vis, col_w)
+            io_col = _center_col(io, io_vis, col_w)
+            disk_col = _center_col(disk, disk_vis, col_w)
+            status_col = _center_col(status_str, status_vis, status_w)
+
+            row = f"| {host_col} | {cpu_col} | {ctx_col} | {io_col} | {disk_col} | {status_col} |"
+        else:
+            row = "| {:<{hw}} | {:^{cw}} | {:^{cw}} | {:^{cw}} | {:^{cw}} | {:^{sw}} |".format(
+                host_display, _health_text(r.cpu_health), _health_text(r.context_health),
+                _health_text(r.io_wait_health), _health_text(r.disk_health),
+                "UP" if r.reachable else "DOWN",
+                hw=host_w, cw=col_w, sw=status_w,
+            )
+
         lines.append(row)
 
         # If host is unreachable, show error on next line
         if not r.reachable and r.error:
-            err_line = f"|   └─ {r.error}"
+            err_msg = _colorize(r.error, ANSI_RED, use_color) if use_color else r.error
+            err_line = f"|   └─ {err_msg}"
             # Pad to table width
             total_w = host_w + 4 * (col_w + 3) + status_w + 3
-            if len(err_line) < total_w:
-                err_line += " " * (total_w - len(err_line))
+            # Calculate visible length (without ANSI codes) for padding
+            visible_len = len(f"|   └─ {r.error}")
+            if visible_len < total_w:
+                err_line += " " * (total_w - visible_len)
             err_line += "|"
             lines.append(err_line)
 
@@ -225,16 +360,16 @@ def _render_table(results: list[HostHealth]) -> str:
 
     lines.append("")
     if critical:
-        lines.append(f"🔴 {critical} host(s) with CRITICAL issues")
+        lines.append(_colorize(f"🔴 {critical} host(s) with CRITICAL issues", ANSI_RED, use_color))
     elif warning:
-        lines.append(f"⚠️  {warning} host(s) with warnings")
+        lines.append(_colorize(f"⚠️  {warning} host(s) with warnings", ANSI_YELLOW, use_color))
     elif unreachable == len(results):
-        lines.append(f"❌ All {unreachable} host(s) unreachable")
+        lines.append(_colorize(f"❌ All {unreachable} host(s) unreachable", ANSI_RED, use_color))
     elif healthy:
-        lines.append(f"✅ All {healthy} host(s) look healthy")
+        lines.append(_colorize(f"✅ All {healthy} host(s) look healthy", ANSI_GREEN, use_color))
 
     if unreachable and unreachable < len(results):
-        lines.append(f"❌ {unreachable} host(s) unreachable")
+        lines.append(_colorize(f"❌ {unreachable} host(s) unreachable", ANSI_RED, use_color))
 
     # Detail section: show issues for each host with warnings/critical
     has_issues = False
@@ -260,8 +395,17 @@ def _render_table(results: list[HostHealth]) -> str:
 
             lines.append(f"  {r.host}:")
             for cat, status, detail, suggestion in issues:
-                icon = "🔴" if status == "critical" else "⚠️ "
-                lines.append(f"    {icon} {cat}: {detail}")
+                if use_color:
+                    if status == "critical":
+                        icon = _colorize("🔴", ANSI_RED, use_color)
+                        label = _colorize(f"{cat}: {detail}", ANSI_RED, use_color)
+                    else:
+                        icon = _colorize("⚠️ ", ANSI_YELLOW, use_color)
+                        label = _colorize(f"{cat}: {detail}", ANSI_YELLOW, use_color)
+                else:
+                    icon = "🔴" if status == "critical" else "⚠️ "
+                    label = f"{cat}: {detail}"
+                lines.append(f"    {icon} {label}")
                 if suggestion:
                     lines.append(f"       → {suggestion}")
 
@@ -291,6 +435,7 @@ def dashboard_command(
     threshold: str = "default",
     port: int = 9100,
     registry_path: Optional[str] = None,
+    use_color: bool = True,
 ):
     """Run the CLI dashboard — scan all registered hosts and print a health table."""
     from linuxdoctor.host_registry import DEFAULT_REGISTRY_PATH as _default_path
@@ -324,7 +469,7 @@ def dashboard_command(
     if json_output:
         click.echo(_render_json(results))
     else:
-        click.echo(_render_table(results))
+        click.echo(_render_table(results, use_color=use_color), color=use_color)
 
     # Exit with non-zero if any critical issues found
     has_critical = any(
