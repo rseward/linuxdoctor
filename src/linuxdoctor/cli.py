@@ -5,6 +5,7 @@ import sys
 import click
 from linuxdoctor.analyze import analyze_host
 from linuxdoctor.prometheus import list_hosts_from_prometheus
+from linuxdoctor.cli_dashboard import dashboard_command
 
 
 @click.group()
@@ -17,7 +18,7 @@ def cli():
 @cli.command()
 @click.option("--json-output", "json_output", is_flag=True, help="Output results as JSON")
 @click.option("--no-recommendations", "no_recs", is_flag=True, help="Skip recommendation generation")
-@click.option("--check", "-c", multiple=True, help="Run only specific checks (cpu,memory,disk,io,network,load,sar)")
+@click.option("--check", "-c", multiple=True, help="Run only specific checks (cpu,memory,disk,io,network,load,sar,smart)")
 @click.option("--threshold", "-t", default="default", help="Threshold profile: default, strict, or relaxed")
 def analyze(json_output, no_recs, check, threshold):
     """Analyze the current host using local performance tools.
@@ -222,6 +223,39 @@ def web(bind_host, port, interval, node_port, threshold, registry_path):
         node_port=node_port,
         registry_path=reg_path,
         threshold_profile=threshold,
+    )
+
+
+@cli.command()
+@click.option("--json", "json_output", is_flag=True, help="Output results as JSON")
+@click.option("--resample", is_flag=True, help="Take two samples for more accurate counter metrics (context switches, disk I/O)")
+@click.option("--resample-interval", "resample_interval", default=None, type=int, help="Seconds between samples (default: 30, requires --resample)")
+@click.option("--threshold", "-t", default="default", help="Threshold profile: default, strict, or relaxed")
+@click.option("--node-port", "node_port", default=9100, type=int, help="Node exporter port (default: 9100)")
+@click.option("--registry", "registry_path", default=None, help="Path to the host registry YAML file")
+def dashboard(json_output, resample, resample_interval, threshold, node_port, registry_path):
+    """Print a one-shot health dashboard for all registered hosts.
+
+    Scans each registered host and prints a summary table of health
+    indicators (CPU, Context Switching, I/O Wait, Disk), then exits.
+
+    Use --resample to take two samples spaced apart for more accurate
+    counter-based metrics (context switches, disk I/O utilization).
+
+    Use --json for machine-readable output. A progress bar (tqdm) is
+    shown during scanning unless --json is specified.
+
+    Example: linuxdoctor dashboard
+    Example: linuxdoctor dashboard --resample
+    Example: linuxdoctor dashboard --json
+    """
+    dashboard_command(
+        json_output=json_output,
+        resample=resample,
+        resample_interval=resample_interval,
+        threshold=threshold,
+        port=node_port,
+        registry_path=registry_path,
     )
 
 

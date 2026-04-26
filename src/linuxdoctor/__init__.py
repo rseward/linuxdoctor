@@ -1,12 +1,13 @@
 """linuxdoctor - Analyze performance metrics and recommend actions."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 from linuxdoctor.analyze import analyze_host
 from linuxdoctor.analyzenode import analyze_remote_node, AnalysisResult, is_ssh_host, analyze_ssh_node
 from linuxdoctor.prometheus import list_hosts_from_prometheus
 from linuxdoctor.web import run_dashboard
 from linuxdoctor.ssh_collector import collect_ssh_metrics, ssh_test_connection, resolve_ssh_connect
+from linuxdoctor.cli_dashboard import scan_hosts_for_dashboard
 
 __all__ = [
     "analyze_host",
@@ -19,4 +20,5 @@ __all__ = [
     "collect_ssh_metrics",
     "ssh_test_connection",
     "resolve_ssh_connect",
+    "scan_hosts_for_dashboard",
 ]
