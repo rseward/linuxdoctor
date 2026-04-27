@@ -49,6 +49,21 @@ def _run_command(cmd: list[str], timeout: int = 10) -> tuple[str, Optional[str]]
         return "", str(e)
 
 
+def _run_command_sudo(cmd: list[str], timeout: int = 10) -> tuple[str, Optional[str]]:
+    """Run a shell command with sudo, falling back to without sudo.
+
+    Tries sudo first (needed for smartctl disk access), then falls back
+    to running without sudo. Returns (stdout, stderr_or_None).
+    """
+    # Try with sudo first (passwordless sudo required)
+    sudo_cmd = ["sudo", "-n"] + cmd  # -n = non-interactive (no password prompt)
+    stdout, err = _run_command(sudo_cmd, timeout=timeout)
+    if err and "a password is required" in (err or ""):
+        # sudo requires password — fall back to running without sudo
+        stdout, err = _run_command(cmd, timeout=timeout)
+    return stdout, err
+
+
 def _tool_available(name: str) -> bool:
     """Check if a command-line tool is available on PATH."""
     return shutil.which(name) is not None
@@ -828,8 +843,8 @@ def collect_sar_metrics() -> MetricCollection:
 
 def _smartctl_scan_devices() -> list[str]:
     """Scan for disks using smartctl --scan and return device paths."""
-    stdout, err = _run_command(["smartctl", "--scan"], timeout=10)
-    if err:
+    stdout, err = _run_command_sudo(["smartctl", "--scan"], timeout=10)
+    if err and not stdout:
         return []
     devices = []
     for line in stdout.strip().splitlines():
@@ -932,13 +947,16 @@ def collect_smart_metrics() -> MetricCollection:
         safe_name = device.replace("/dev/", "").replace("/", "_")
 
         # Check overall health status: smartctl -H <device>
-        stdout, err = _run_command(["smartctl", "-H", device], timeout=15)
+        stdout, err = _run_command_sudo(["smartctl", "-H", device], timeout=15)
         if err and not stdout:
-            collection.metrics.append(MetricResult(
-                name=f"smart_{safe_name}_health", value="unknown", source="smartctl -H",
-                raw_output=err, error=f"smartctl -H failed for {device}: {err}"
-            ))
-            continue
+            # Try without sudo as fallback
+            stdout, err = _run_command(["smartctl", "-H", device], timeout=15)
+            if err and not stdout:
+                collection.metrics.append(MetricResult(
+                    name=f"smart_{safe_name}_health", value="unknown", source="smartctl -H",
+                    raw_output=err, error=f"smartctl -H failed for {device}: {err}"
+                ))
+                continue
 
         # Parse health status
         # Typical output:
@@ -971,10 +989,13 @@ def collect_smart_metrics() -> MetricCollection:
         ))
 
         # Collect key SMART attributes: smartctl -A <device>
-        stdout, err = _run_command(["smartctl", "-A", device], timeout=15)
+        stdout, err = _run_command_sudo(["smartctl", "-A", device], timeout=15)
         if err and not stdout:
-            # Attributes not available (e.g., NVMe devices may not support -A)
-            continue
+            # Try without sudo as fallback
+            stdout, err = _run_command(["smartctl", "-A", device], timeout=15)
+            if err and not stdout:
+                # Attributes not available (e.g., NVMe devices may not support -A)
+                continue
 
         attrs = _parse_smart_attributes(stdout)
 

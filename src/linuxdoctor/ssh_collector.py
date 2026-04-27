@@ -170,6 +170,9 @@ def collect_ssh_metrics(ssh_connect: str, allow_interactive: bool = False,
     # Context switches via /proc/stat
     _collect_ssh_context_switches(ssh_connect, metrics, allow_interactive, missing_tools)
 
+    # SMART disk health via smartctl
+    _collect_ssh_smart(ssh_connect, metrics, allow_interactive, missing_tools)
+
     return metrics
 
 
@@ -427,6 +430,199 @@ def _collect_ssh_context_switches(ssh_connect: str, metrics: dict, allow_interac
                 pass
 
 
+def _collect_ssh_smart(ssh_connect: str, metrics: dict, allow_interactive: bool,
+                       missing_tools: list):
+    """Collect SMART disk health metrics from remote host via smartctl.
+
+    Scans for disks using `smartctl --scan`, then collects overall health
+    status and key SMART attributes for each device. Results are stored
+    in a format compatible with the local collector's smart metrics,
+    using `node_smart_*` metric names for integration with analyzenode.
+
+    Requires sudo/root on the remote host for smartctl to access disk data.
+    """
+    # Check if smartctl is available on the remote host
+    path_prefix = 'PATH=/usr/local/sbin:/usr/sbin:/sbin:$PATH'
+    result = ssh_run(ssh_connect, f'{path_prefix}; command -v smartctl >/dev/null 2>&1 && echo FOUND || echo MISSING',
+                     timeout=10, allow_interactive=allow_interactive)
+    if result.error or 'FOUND' not in result.stdout:
+        missing_tools.append("smartctl")
+        return
+
+    # Scan for devices
+    result = ssh_run(ssh_connect, f'{path_prefix}; sudo smartctl --scan',
+                     timeout=10, allow_interactive=allow_interactive)
+    if result.error and not result.stdout:
+        # Try without sudo (may work for some devices or with proper group membership)
+        result = ssh_run(ssh_connect, f'{path_prefix}; smartctl --scan',
+                         timeout=10, allow_interactive=allow_interactive)
+        if result.error and not result.stdout:
+            return
+
+    devices = []
+    for line in result.stdout.strip().splitlines():
+        parts = line.split()
+        if parts:
+            devices.append(parts[0])
+
+    if not devices:
+        # Fallback: try common device paths
+        result = ssh_run(ssh_connect,
+                         f'{path_prefix}; ls /dev/sda /dev/sdb /dev/nvme0n1 /dev/nvme1n1 2>/dev/null',
+                         timeout=5, allow_interactive=allow_interactive)
+        if not result.error:
+            for line in result.stdout.strip().splitlines():
+                dev = line.strip()
+                if dev and dev.startswith("/dev/"):
+                    devices.append(dev)
+
+    if not devices:
+        return
+
+    smart_entries = []
+
+    for device in devices:
+        safe_name = device.replace("/dev/", "").replace("/", "_")
+
+        # Check overall health status
+        result = ssh_run(ssh_connect, f'{path_prefix}; sudo smartctl -H {device}',
+                         timeout=15, allow_interactive=allow_interactive)
+        if result.error and not result.stdout:
+            # Try without sudo
+            result = ssh_run(ssh_connect, f'{path_prefix}; smartctl -H {device}',
+                             timeout=15, allow_interactive=allow_interactive)
+            if result.error and not result.stdout:
+                continue
+
+        health_status = "unknown"
+        combined = f"{result.stdout}\n{result.stderr}".strip() if result.stderr else result.stdout.strip()
+        for line in combined.splitlines():
+            lower = line.lower()
+            if "passed" in lower or ("ok" in lower and "health" in lower):
+                health_status = "passed"
+                break
+            elif "failed" in lower or "failing" in lower or "failure" in lower:
+                health_status = "failed"
+                break
+            elif "permission denied" in lower:
+                health_status = "no_access"
+                break
+
+        health_code_map = {"passed": 0, "warning": 1, "failed": 2, "unknown": 3, "no_access": 3}
+
+        smart_entries.append({
+            "labels": {"device": safe_name},
+            "health": health_status,
+            "health_code": health_code_map.get(health_status, 3),
+            "attributes": {},
+        })
+
+        # Skip attribute collection if we couldn't access the device
+        if health_status == "no_access":
+            continue
+
+        # Collect SMART attributes
+        result = ssh_run(ssh_connect, f'{path_prefix}; sudo smartctl -A {device}',
+                         timeout=15, allow_interactive=allow_interactive)
+        if result.error and not result.stdout:
+            result = ssh_run(ssh_connect, f'{path_prefix}; smartctl -A {device}',
+                             timeout=15, allow_interactive=allow_interactive)
+            if result.error and not result.stdout:
+                continue
+
+        # Parse attributes (same logic as local collector)
+        attrs = _parse_ssh_smart_attributes(result.stdout)
+
+        # Map to standardized attribute names
+        key_attrs = {
+            "Reallocated_Sector_Ct": "reallocated_sectors",
+            "Reallocated_Sector": "reallocated_sectors",
+            "Pending_Sector_Ct": "pending_sectors",
+            "Current_Pending_Sector": "pending_sectors",
+            "Offline_Uncorrectable": "uncorrectable_sectors",
+            "Offline_Uncorrectable_Ct": "uncorrectable_sectors",
+            "Reported_Uncorrect": "uncorrectable_sectors",
+            "Reported_Uncorrectable": "uncorrectable_sectors",
+            "Temperature_Celsius": "temperature",
+            "Temperature": "temperature",
+            "Airflow_Temperature_Cel": "temperature",
+            "Temperature_Case": "temperature",
+            "Spin_Retry_Count": "spin_retries",
+            "Spin_Up_Retry_Count": "spin_retries",
+            "Runtime_Bad_Block": "bad_blocks",
+            "End_to_End_Error": "e2e_errors",
+            "SSD_Life_Left": "ssd_life_left",
+            "Percent_Life_Remaining": "ssd_life_left",
+            "Wear_Leveling_Count": "wear_leveling",
+            "Media_Wearout_Indicator": "wear_leveling",
+            "Power_On_Hours": "power_on_hours",
+        }
+
+        # Update the last smart_entry with attributes
+        reported = set()
+        for attr_name, attr_data in attrs.items():
+            if attr_name in key_attrs:
+                metric_name = key_attrs[attr_name]
+                if metric_name in reported:
+                    continue
+                reported.add(metric_name)
+
+                if "temperature" in metric_name:
+                    smart_entries[-1]["attributes"][metric_name] = attr_data["raw"]
+                elif "ssd_life_left" in metric_name or "wear_leveling" in metric_name:
+                    smart_entries[-1]["attributes"][metric_name] = attr_data["value"]
+                elif "power_on_hours" in metric_name:
+                    smart_entries[-1]["attributes"][metric_name] = attr_data["raw"]
+                else:
+                    smart_entries[-1]["attributes"][metric_name] = attr_data["raw"]
+
+                if attr_data.get("when_failed", "-") != "-":
+                    smart_entries[-1]["attributes"][f"{metric_name}_failed"] = attr_data["when_failed"]
+
+    if smart_entries:
+        metrics["node_smart_devices"] = smart_entries
+
+
+def _parse_ssh_smart_attributes(output: str) -> dict[str, dict]:
+    """Parse smartctl -A output into a dict of attribute dicts.
+
+    Returns a dict keyed by attribute name, each value being:
+        {"id": int, "value": int, "worst": int, "thresh": int, "raw": int, "when_failed": str}
+    """
+    attrs = {}
+    in_attrs = False
+    for line in output.splitlines():
+        if line.strip().startswith("ID#") or ("ATTRIBUTE_NAME" in line and "RAW_VALUE" in line):
+            in_attrs = True
+            continue
+        if not in_attrs:
+            continue
+        if not line.strip() or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) >= 10:
+            try:
+                attr_id = int(parts[0])
+                attr_name = parts[1]
+                attr_value = int(parts[3])
+                attr_worst = int(parts[4])
+                attr_thresh = int(parts[5])
+                raw_str = parts[9]
+                raw_val = int(raw_str) if raw_str.isdigit() else 0
+                when_failed = parts[8] if len(parts) > 8 else "-"
+                attrs[attr_name] = {
+                    "id": attr_id,
+                    "value": attr_value,
+                    "worst": attr_worst,
+                    "thresh": attr_thresh,
+                    "raw": raw_val,
+                    "when_failed": when_failed,
+                }
+            except (ValueError, IndexError):
+                continue
+    return attrs
+
+
 # ---------------------------------------------------------------------------
 # Remote tool availability check
 # ---------------------------------------------------------------------------
@@ -437,7 +633,7 @@ REMOTE_DIAGNOSTIC_TOOLS = [
     "mpstat", "sar", "iostat", "pidstat", "perf",
     "vmstat", "ss", "iotop", "blktrace",
     "ncdu", "ethtool", "smem",
-    "pstree",
+    "pstree", "smartctl",
 ]
 
 

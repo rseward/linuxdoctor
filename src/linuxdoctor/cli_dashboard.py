@@ -217,7 +217,7 @@ def scan_hosts_for_dashboard(
 def _render_table(results: list[HostHealth], use_color: bool = True) -> str:
     """Render health results as a terminal table.
 
-    Columns: Host | CPU | Context | I/O Wait | Disk | Status
+    Columns: Host | CPU | Context | I/O Wait | Disk | SMART | Status
 
     Args:
         results: List of HostHealth objects to render.
@@ -236,16 +236,17 @@ def _render_table(results: list[HostHealth], use_color: bool = True) -> str:
             host_w = max(host_w, len(r.host) + len(r.ssh_connect) + 6)
 
     col_w = 8  # width for health columns
+    smart_w = 8  # SMART column
     status_w = 12
 
     # Header
     sep = "+" + "-" * (host_w + 2) + "+" + "-" * (col_w + 2) + "+" + \
           "-" * (col_w + 2) + "+" + "-" * (col_w + 2) + "+" + \
-          "-" * (col_w + 2) + "+" + "-" * (status_w + 2) + "+"
+          "-" * (col_w + 2) + "+" + "-" * (smart_w + 2) + "+" + "-" * (status_w + 2) + "+"
 
-    header = "| {:<{hw}} | {:^{cw}} | {:^{cw}} | {:^{cw}} | {:^{cw}} | {:^{sw}} |".format(
-        "Host", "CPU", "Context", "I/O Wait", "Disk", "Status",
-        hw=host_w, cw=col_w, sw=status_w,
+    header = "| {:<{hw}} | {:^{cw}} | {:^{cw}} | {:^{cw}} | {:^{cw}} | {:^{sw}} | {:^{stw}} |".format(
+        "Host", "CPU", "Context", "I/O Wait", "Disk", "SMART", "Status",
+        hw=host_w, cw=col_w, sw=smart_w, stw=status_w,
     )
 
     lines = [
@@ -275,6 +276,7 @@ def _render_table(results: list[HostHealth], use_color: bool = True) -> str:
         ctx = _colorize_health(_health_text(r.context_health), r.context_health, use_color)
         io = _colorize_health(_health_text(r.io_wait_health), r.io_wait_health, use_color)
         disk = _colorize_health(_health_text(r.disk_health), r.disk_health, use_color)
+        smart = _colorize_health(_health_text(r.smart_health), r.smart_health, use_color)
 
         # Note: When color is active, ANSI codes make strings wider than
         # visible chars, so we format using the plain (uncolored) widths
@@ -286,29 +288,16 @@ def _render_table(results: list[HostHealth], use_color: bool = True) -> str:
             ctx_plain = _health_text(r.context_health)
             io_plain = _health_text(r.io_wait_health)
             disk_plain = _health_text(r.disk_health)
+            smart_plain = _health_text(r.smart_health)
             status_plain = "UP" if r.reachable else "DOWN"
 
-            row = "| {:<{hw}} | {:^{cw}} | {:^{cw}} | {:^{cw}} | {:^{cw}} | {:^{sw}} |".format(
-                host_display, cpu_plain, ctx_plain, io_plain, disk_plain, status_plain,
-                hw=host_w, cw=col_w, sw=status_w,
-            )
-            # Now replace the plain values with colored versions
-            # This is safe because each plain value appears exactly once in the row
-            # We replace from left to right, longest first to avoid partial matches
-            # The Status column value is right-padded; find and replace it carefully
-
-            # Replace in reverse order of appearance to preserve positions
-            # Status column is the last formatted value
-            # We need to handle the padding — find the plain text in the row
-            # and replace with colored version
-
-            # Safer approach: rebuild the row piece by piece
             host_pad = host_w
             # Calculate visible widths for centering
             cpu_vis = len(cpu_plain)
             ctx_vis = len(ctx_plain)
             io_vis = len(io_plain)
             disk_vis = len(disk_plain)
+            smart_vis = len(smart_plain)
             status_vis = len(status_plain)
 
             # Build left-aligned host col
@@ -318,15 +307,17 @@ def _render_table(results: list[HostHealth], use_color: bool = True) -> str:
             ctx_col = _center_col(ctx, ctx_vis, col_w)
             io_col = _center_col(io, io_vis, col_w)
             disk_col = _center_col(disk, disk_vis, col_w)
+            smart_col = _center_col(smart, smart_vis, smart_w)
             status_col = _center_col(status_str, status_vis, status_w)
 
-            row = f"| {host_col} | {cpu_col} | {ctx_col} | {io_col} | {disk_col} | {status_col} |"
+            row = f"| {host_col} | {cpu_col} | {ctx_col} | {io_col} | {disk_col} | {smart_col} | {status_col} |"
         else:
-            row = "| {:<{hw}} | {:^{cw}} | {:^{cw}} | {:^{cw}} | {:^{cw}} | {:^{sw}} |".format(
+            row = "| {:<{hw}} | {:^{cw}} | {:^{cw}} | {:^{cw}} | {:^{cw}} | {:^{sw}} | {:^{stw}} |".format(
                 host_display, _health_text(r.cpu_health), _health_text(r.context_health),
                 _health_text(r.io_wait_health), _health_text(r.disk_health),
+                _health_text(r.smart_health),
                 "UP" if r.reachable else "DOWN",
-                hw=host_w, cw=col_w, sw=status_w,
+                hw=host_w, cw=col_w, sw=smart_w, stw=status_w,
             )
 
         lines.append(row)
@@ -336,7 +327,7 @@ def _render_table(results: list[HostHealth], use_color: bool = True) -> str:
             err_msg = _colorize(r.error, ANSI_RED, use_color) if use_color else r.error
             err_line = f"|   └─ {err_msg}"
             # Pad to table width
-            total_w = host_w + 4 * (col_w + 3) + status_w + 3
+            total_w = host_w + 4 * (col_w + 3) + (smart_w + 3) + status_w + 3
             # Calculate visible length (without ANSI codes) for padding
             visible_len = len(f"|   └─ {r.error}")
             if visible_len < total_w:
@@ -349,13 +340,13 @@ def _render_table(results: list[HostHealth], use_color: bool = True) -> str:
     # Summary
     healthy = sum(1 for r in results if r.reachable and
                   all(getattr(r, f"{c}_health", "unknown") != "critical"
-                      for c in ("cpu", "context", "io_wait", "disk")))
+                      for c in ("cpu", "context", "io_wait", "disk", "smart")))
     critical = sum(1 for r in results if r.reachable and
                    any(getattr(r, f"{c}_health") == "critical"
-                       for c in ("cpu", "context", "io_wait", "disk")))
+                       for c in ("cpu", "context", "io_wait", "disk", "smart")))
     warning = sum(1 for r in results if r.reachable and critical == 0 and
                  any(getattr(r, f"{c}_health") == "warning"
-                     for c in ("cpu", "context", "io_wait", "disk")))
+                     for c in ("cpu", "context", "io_wait", "disk", "smart")))
     unreachable = sum(1 for r in results if not r.reachable)
 
     lines.append("")
@@ -378,7 +369,8 @@ def _render_table(results: list[HostHealth], use_color: bool = True) -> str:
             continue
         issues = []
         for cat, attr in [("CPU", "cpu_health"), ("Context", "context_health"),
-                          ("I/O Wait", "io_wait_health"), ("Disk", "disk_health")]:
+                          ("I/O Wait", "io_wait_health"), ("Disk", "disk_health"),
+                          ("SMART", "smart_health")]:
             status = getattr(r, attr, "unknown")
             if status in ("warning", "critical"):
                 detail = getattr(r, f"{attr.replace('_health', '_detail')}", "")
@@ -474,7 +466,7 @@ def dashboard_command(
     # Exit with non-zero if any critical issues found
     has_critical = any(
         any(getattr(r, f"{c}_health") == "critical"
-            for c in ("cpu", "context", "io_wait", "disk"))
+            for c in ("cpu", "context", "io_wait", "disk", "smart"))
         for r in results if r.reachable
     )
     if has_critical:

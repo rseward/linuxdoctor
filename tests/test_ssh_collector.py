@@ -291,3 +291,151 @@ class TestCheckRemoteTools:
         assert len(result) == len(REMOTE_DIAGNOSTIC_TOOLS)
         for tool in REMOTE_DIAGNOSTIC_TOOLS:
             assert tool in result
+
+
+class TestCollectSSHSmart:
+    """Tests for SMART metric collection via SSH."""
+
+    @patch("linuxdoctor.ssh_collector.ssh_run")
+    def test_smartctl_missing_on_remote(self, mock_ssh_run):
+        """When smartctl is not available on remote host, should add to missing_tools."""
+        def mock_run_side_effect(ssh_connect, command, **kwargs):
+            if "smartctl" in command and "command -v" in command:
+                return SSHResult(stdout="MISSING", returncode=0, error=None)
+            # Other commands fail too
+            return SSHResult(error="not available")
+
+        mock_ssh_run.side_effect = mock_run_side_effect
+        missing_tools = []
+        metrics = collect_ssh_metrics("user@host", missing_tools=missing_tools)
+        assert "smartctl" in missing_tools
+        assert "node_smart_devices" not in metrics
+
+    @patch("linuxdoctor.ssh_collector.ssh_run")
+    def test_smart_health_passed(self, mock_ssh_run):
+        """Should collect SMART health status when smartctl is available."""
+        def mock_run_side_effect(ssh_connect, command, **kwargs):
+            if "smartctl" in command and "command -v" in command:
+                return SSHResult(stdout="FOUND", returncode=0, error=None)
+            if "smartctl --scan" in command:
+                return SSHResult(stdout="/dev/sda -d scsi # /dev/sda", returncode=0, error=None)
+            if "smartctl -H /dev/sda" in command:
+                return SSHResult(
+                    stdout="SMART overall-health self-assessment test result: PASSED",
+                    returncode=0, error=None
+                )
+            if "smartctl -A /dev/sda" in command:
+                return SSHResult(stdout="", returncode=0, error=None)
+            # Other commands fail
+            return SSHResult(error="not available")
+
+        mock_ssh_run.side_effect = mock_run_side_effect
+        metrics = collect_ssh_metrics("user@host")
+        assert "node_smart_devices" in metrics
+        devices = metrics["node_smart_devices"]
+        assert len(devices) == 1
+        assert devices[0]["health"] == "passed"
+        assert devices[0]["health_code"] == 0
+
+    @patch("linuxdoctor.ssh_collector.ssh_run")
+    def test_smart_health_failed(self, mock_ssh_run):
+        """Should detect SMART health FAILED status."""
+        def mock_run_side_effect(ssh_connect, command, **kwargs):
+            if "smartctl" in command and "command -v" in command:
+                return SSHResult(stdout="FOUND", returncode=0, error=None)
+            if "smartctl --scan" in command:
+                return SSHResult(stdout="/dev/sda -d scsi # /dev/sda", returncode=0, error=None)
+            if "smartctl -H /dev/sda" in command:
+                return SSHResult(
+                    stdout="SMART overall-health self-assessment test result: FAILED!",
+                    returncode=0, error=None
+                )
+            if "smartctl -A /dev/sda" in command:
+                return SSHResult(stdout="", returncode=0, error=None)
+            return SSHResult(error="not available")
+
+        mock_ssh_run.side_effect = mock_run_side_effect
+        metrics = collect_ssh_metrics("user@host")
+        devices = metrics["node_smart_devices"]
+        assert devices[0]["health"] == "failed"
+        assert devices[0]["health_code"] == 2
+
+    @patch("linuxdoctor.ssh_collector.ssh_run")
+    def test_smart_with_attributes(self, mock_ssh_run):
+        """Should collect SMART attributes from remote host."""
+        smart_attrs_output = """smartctl 7.4
+=== START OF READ SMART DATA SECTION ===
+SMART Attributes Data Structure revision number: 16
+Vendor Specific SMART Attributes with Thresholds:
+ID# ATTRIBUTE_NAME          FLAG     VALUE WORST THRESH TYPE      UPDATED  WHEN_FAILED RAW_VALUE
+  5 Reallocated_Sector_Ct   0x0033   100   100   010    Pre-fail  Always       -       0
+  9 Temperature_Celsius     0x0023   064   052   000    Old_age   Always       -       36
+197 Current_Pending_Sector  0x0032   100   100   000    Old_age   Always       -       2
+"""
+
+        def mock_run_side_effect(ssh_connect, command, **kwargs):
+            if "smartctl" in command and "command -v" in command:
+                return SSHResult(stdout="FOUND", returncode=0, error=None)
+            if "smartctl --scan" in command:
+                return SSHResult(stdout="/dev/sda -d scsi # /dev/sda", returncode=0, error=None)
+            if "smartctl -H /dev/sda" in command:
+                return SSHResult(
+                    stdout="SMART overall-health self-assessment test result: PASSED",
+                    returncode=0, error=None
+                )
+            if "smartctl -A /dev/sda" in command:
+                return SSHResult(stdout=smart_attrs_output, returncode=0, error=None)
+            return SSHResult(error="not available")
+
+        mock_ssh_run.side_effect = mock_run_side_effect
+        metrics = collect_ssh_metrics("user@host")
+        devices = metrics["node_smart_devices"]
+        assert len(devices) == 1
+        attrs = devices[0]["attributes"]
+        assert "reallocated_sectors" in attrs
+        assert attrs["reallocated_sectors"] == 0
+        assert "temperature" in attrs
+        assert attrs["temperature"] == 36
+        assert "pending_sectors" in attrs
+        assert attrs["pending_sectors"] == 2
+
+
+class TestParseSSHSmartAttributes:
+    """Tests for _parse_ssh_smart_attributes function."""
+
+    def test_parse_standard_attributes(self):
+        """Should parse standard smartctl -A output."""
+        from linuxdoctor.ssh_collector import _parse_ssh_smart_attributes
+        smart_output = """smartctl 7.4 2023-08-01 r5530 [x86_64-linux-6.8.0]
+=== START OF READ SMART DATA SECTION ===
+SMART Attributes Data Structure revision number: 16
+Vendor Specific SMART Attributes with Thresholds:
+ID# ATTRIBUTE_NAME          FLAG     VALUE WORST THRESH TYPE      UPDATED  WHEN_FAILED RAW_VALUE
+  5 Reallocated_Sector_Ct   0x0033   100   100   010    Pre-fail  Always       -       0
+  9 Power_On_Hours          0x0032   093   093   000    Old_age   Always       -       6789
+194 Temperature_Celsius     0x0023   064   052   000    Old_age   Always       -       36
+"""
+        attrs = _parse_ssh_smart_attributes(smart_output)
+        assert "Reallocated_Sector_Ct" in attrs
+        assert attrs["Reallocated_Sector_Ct"]["raw"] == 0
+        assert attrs["Reallocated_Sector_Ct"]["value"] == 100
+        assert "Temperature_Celsius" in attrs
+        assert attrs["Temperature_Celsius"]["raw"] == 36
+        assert "Power_On_Hours" in attrs
+        assert attrs["Power_On_Hours"]["raw"] == 6789
+
+    def test_parse_empty_output(self):
+        """Should handle empty smartctl output."""
+        from linuxdoctor.ssh_collector import _parse_ssh_smart_attributes
+        attrs = _parse_ssh_smart_attributes("")
+        assert attrs == {}
+
+    def test_parse_failing_attribute(self):
+        """Should detect WHEN_FAILED column for failing attributes."""
+        from linuxdoctor.ssh_collector import _parse_ssh_smart_attributes
+        smart_output = """ID# ATTRIBUTE_NAME          FLAG     VALUE WORST THRESH TYPE      UPDATED  WHEN_FAILED RAW_VALUE
+  5 Reallocated_Sector_Ct   0x0033   001   001   010    Pre-fail  Always   FAILING_NOW  100
+"""
+        attrs = _parse_ssh_smart_attributes(smart_output)
+        assert attrs["Reallocated_Sector_Ct"]["when_failed"] == "FAILING_NOW"
+        assert attrs["Reallocated_Sector_Ct"]["raw"] == 100

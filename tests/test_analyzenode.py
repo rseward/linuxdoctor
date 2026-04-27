@@ -573,3 +573,211 @@ class TestAnalyzeSSHNode:
         result = analyze_remote_node("myremote", json_output=True, registry_path=registry_path)
         data = json.loads(result)
         assert "node" in data
+
+
+class TestAnalyzeSmart:
+    """Tests for SMART disk health analysis in analyzenode."""
+
+    def _default_thresholds(self):
+        return _get_thresholds("default")
+
+    def test_smart_not_available(self):
+        """When no SMART metrics are present, should show info message."""
+        from linuxdoctor.analyzenode import analyze_smart
+        metrics = {}
+        result = analyze_smart(metrics, self._default_thresholds())
+        assert result.category == "smart"
+        assert any("not available" in line.lower() or "SMART" in line for line in result.lines)
+        assert "smartctl" in result.missing_tools
+
+    def test_smart_health_passed(self):
+        """Healthy SMART data should generate no recommendations."""
+        from linuxdoctor.analyzenode import analyze_smart
+        metrics = {
+            "node_smart_devices": [
+                {
+                    "labels": {"device": "sda"},
+                    "health": "passed",
+                    "health_code": 0,
+                    "attributes": {
+                        "reallocated_sectors": 0,
+                        "pending_sectors": 0,
+                        "uncorrectable_sectors": 0,
+                        "temperature": 35,
+                    },
+                }
+            ]
+        }
+        result = analyze_smart(metrics, self._default_thresholds())
+        assert result.category == "smart"
+        assert len(result.recommendations) == 0
+
+    def test_smart_health_failed(self):
+        """Failed SMART health should generate critical recommendation."""
+        from linuxdoctor.analyzenode import analyze_smart
+        metrics = {
+            "node_smart_devices": [
+                {
+                    "labels": {"device": "sda"},
+                    "health": "failed",
+                    "health_code": 2,
+                    "attributes": {},
+                }
+            ]
+        }
+        result = analyze_smart(metrics, self._default_thresholds())
+        assert len(result.recommendations) >= 1
+        assert any("FAILED" in r.message for r in result.recommendations)
+        assert any(r.severity == "critical" for r in result.recommendations)
+
+    def test_smart_no_access(self):
+        """SMART no_access should generate info recommendation about sudo."""
+        from linuxdoctor.analyzenode import analyze_smart
+        metrics = {
+            "node_smart_devices": [
+                {
+                    "labels": {"device": "sda"},
+                    "health": "no_access",
+                    "health_code": 3,
+                    "attributes": {},
+                }
+            ]
+        }
+        result = analyze_smart(metrics, self._default_thresholds())
+        assert any("elevated" in r.message.lower() or "sudo" in r.action.lower() for r in result.recommendations)
+
+    def test_smart_reallocated_sectors_critical(self):
+        """High reallocated sectors should generate critical recommendation."""
+        from linuxdoctor.analyzenode import analyze_smart
+        metrics = {
+            "node_smart_devices": [
+                {
+                    "labels": {"device": "sda"},
+                    "health": "passed",
+                    "health_code": 0,
+                    "attributes": {
+                        "reallocated_sectors": 50,
+                    },
+                }
+            ]
+        }
+        result = analyze_smart(metrics, self._default_thresholds())
+        assert any("reallocated" in r.message for r in result.recommendations)
+        assert any(r.severity == "critical" for r in result.recommendations)
+
+    def test_smart_reallocated_sectors_warning(self):
+        """A few reallocated sectors should generate warning."""
+        from linuxdoctor.analyzenode import analyze_smart
+        metrics = {
+            "node_smart_devices": [
+                {
+                    "labels": {"device": "sda"},
+                    "health": "passed",
+                    "health_code": 0,
+                    "attributes": {
+                        "reallocated_sectors": 2,
+                    },
+                }
+            ]
+        }
+        result = analyze_smart(metrics, self._default_thresholds())
+        assert any("reallocated" in r.message for r in result.recommendations)
+        assert any(r.severity == "warning" for r in result.recommendations)
+
+    def test_smart_temperature_warning(self):
+        """High disk temperature should generate warning."""
+        from linuxdoctor.analyzenode import analyze_smart
+        metrics = {
+            "node_smart_devices": [
+                {
+                    "labels": {"device": "sda"},
+                    "health": "passed",
+                    "health_code": 0,
+                    "attributes": {
+                        "temperature": 60,
+                    },
+                }
+            ]
+        }
+        result = analyze_smart(metrics, self._default_thresholds())
+        assert any("temperature" in r.message.lower() for r in result.recommendations)
+
+    def test_smart_ssd_life_critical(self):
+        """Low SSD life should generate critical recommendation."""
+        from linuxdoctor.analyzenode import analyze_smart
+        metrics = {
+            "node_smart_devices": [
+                {
+                    "labels": {"device": "sda"},
+                    "health": "passed",
+                    "health_code": 0,
+                    "attributes": {
+                        "ssd_life_left": 5,
+                    },
+                }
+            ]
+        }
+        result = analyze_smart(metrics, self._default_thresholds())
+        assert any("life" in r.message for r in result.recommendations)
+        assert any(r.severity == "critical" for r in result.recommendations)
+
+    def test_smart_spin_retries_warning(self):
+        """Spin retries > 0 should generate warning."""
+        from linuxdoctor.analyzenode import analyze_smart
+        metrics = {
+            "node_smart_devices": [
+                {
+                    "labels": {"device": "sda"},
+                    "health": "passed",
+                    "health_code": 0,
+                    "attributes": {
+                        "spin_retries": 3,
+                    },
+                }
+            ]
+        }
+        result = analyze_smart(metrics, self._default_thresholds())
+        assert any("spin" in r.message for r in result.recommendations)
+
+    def test_smart_multiple_devices(self):
+        """SMART metrics for multiple devices should generate separate recommendations."""
+        from linuxdoctor.analyzenode import analyze_smart
+        metrics = {
+            "node_smart_devices": [
+                {
+                    "labels": {"device": "sda"},
+                    "health": "passed",
+                    "health_code": 0,
+                    "attributes": {"reallocated_sectors": 50},
+                },
+                {
+                    "labels": {"device": "sdb"},
+                    "health": "failed",
+                    "health_code": 2,
+                    "attributes": {},
+                },
+            ]
+        }
+        result = analyze_smart(metrics, self._default_thresholds())
+        sda_recs = [r for r in result.recommendations if "sda" in r.message]
+        sdb_recs = [r for r in result.recommendations if "sdb" in r.message]
+        assert len(sda_recs) >= 1
+        assert len(sdb_recs) >= 1
+
+    def test_smart_strict_thresholds(self):
+        """Strict thresholds should flag lower values as critical."""
+        from linuxdoctor.analyzenode import analyze_smart
+        metrics = {
+            "node_smart_devices": [
+                {
+                    "labels": {"device": "sda"},
+                    "health": "passed",
+                    "health_code": 0,
+                    "attributes": {"reallocated_sectors": 2},
+                },
+            ]
+        }
+        result_strict = analyze_smart(metrics, _get_thresholds("strict"))
+        # In strict mode, 2 reallocated sectors exceeds the threshold of 1
+        critical_recs = [r for r in result_strict.recommendations if r.severity == "critical" and "reallocated" in r.message]
+        assert len(critical_recs) >= 1

@@ -28,6 +28,7 @@ from linuxdoctor.analyzenode import (
     analyze_disk_io,
     analyze_network,
     analyze_context_switching,
+    analyze_smart,
     _get_thresholds,
     AnalysisResult,
     Recommendation,
@@ -67,6 +68,9 @@ class HostHealth:
     disk_health: str = "unknown"
     disk_detail: str = ""
     disk_suggestion: str = ""
+    smart_health: str = "unknown"
+    smart_detail: str = ""
+    smart_suggestion: str = ""
     # Full analysis JSON for modal view
     full_analysis: dict = field(default_factory=dict)
 
@@ -206,6 +210,7 @@ def scan_host(host: str, port: int = 9100, threshold_profile: str = "default",
             cpu_cores=cpu_cores,
             node_address=host,
         ),
+        analyze_smart(metrics, thresholds),
     ]
 
     # Build health indicators
@@ -220,6 +225,9 @@ def scan_host(host: str, port: int = 9100, threshold_profile: str = "default",
 
     health.disk_health = _worst_severity(results, "disk")
     health.disk_detail, health.disk_suggestion = _category_detail(results, "disk")
+
+    health.smart_health = _worst_severity(results, "smart")
+    health.smart_detail, health.smart_suggestion = _category_detail(results, "smart")
 
     # Build full analysis dict for modal
     all_recs = []
@@ -323,6 +331,7 @@ def scan_ssh_host(host: str, threshold_profile: str = "default",
             cpu_cores=cpu_cores,
             node_address=host,
         ),
+        analyze_smart(metrics, thresholds),
     ]
 
     # Build health indicators
@@ -337,6 +346,9 @@ def scan_ssh_host(host: str, threshold_profile: str = "default",
 
     health.disk_health = _worst_severity(results, "disk")
     health.disk_detail, health.disk_suggestion = _category_detail(results, "disk")
+
+    health.smart_health = _worst_severity(results, "smart")
+    health.smart_detail, health.smart_suggestion = _category_detail(results, "smart")
 
     # Build full analysis dict for modal
     all_recs = []
@@ -670,7 +682,7 @@ function renderDashboard(data) {
   }
 
   let html = '<table><thead><tr>';
-  html += '<th>Host</th><th>CPU</th><th>Context</th><th>I/O Wait</th><th>Disk</th>';
+  html += '<th>Host</th><th>CPU</th><th>Context</th><th>I/O Wait</th><th>Disk</th><th>SMART</th>';
   html += '</tr></thead><tbody>';
 
   for (const h of hosts) {
@@ -698,6 +710,7 @@ function renderDashboard(data) {
       { status: h.context_health, detail: h.context_detail, suggestion: h.context_suggestion },
       { status: h.io_wait_health, detail: h.io_wait_detail, suggestion: h.io_wait_suggestion },
       { status: h.disk_health, detail: h.disk_detail, suggestion: h.disk_suggestion },
+      { status: h.smart_health, detail: h.smart_detail, suggestion: h.smart_suggestion },
     ];
 
     for (const col of cols) {

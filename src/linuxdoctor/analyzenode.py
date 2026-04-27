@@ -101,6 +101,12 @@ THRESHOLDS = {
         "context_switches_per_core_warn": 1000,   # switches/core/sec warning
         "context_switches_per_core_critical": 5000, # switches/core/sec critical
         "context_switches_total_warn": 10000,      # total switches/sec absolute warning
+        # SMART disk health thresholds
+        "smart_reallocated_sectors": 10,
+        "smart_pending_sectors": 5,
+        "smart_uncorrectable_sectors": 1,
+        "smart_temperature_c": 55,
+        "smart_ssd_life_pct": 20,
     },
     "strict": {
         "cpu_idle_warn_pct": 30,
@@ -113,6 +119,11 @@ THRESHOLDS = {
         "context_switches_per_core_warn": 500,
         "context_switches_per_core_critical": 2000,
         "context_switches_total_warn": 5000,
+        "smart_reallocated_sectors": 1,
+        "smart_pending_sectors": 1,
+        "smart_uncorrectable_sectors": 0,
+        "smart_temperature_c": 45,
+        "smart_ssd_life_pct": 30,
     },
     "relaxed": {
         "cpu_idle_warn_pct": 10,
@@ -125,6 +136,11 @@ THRESHOLDS = {
         "context_switches_per_core_warn": 2000,
         "context_switches_per_core_critical": 10000,
         "context_switches_total_warn": 20000,
+        "smart_reallocated_sectors": 100,
+        "smart_pending_sectors": 50,
+        "smart_uncorrectable_sectors": 10,
+        "smart_temperature_c": 65,
+        "smart_ssd_life_pct": 10,
     },
 }
 
@@ -706,6 +722,198 @@ def analyze_context_switching(
     return result
 
 
+def analyze_smart(metrics: dict, thresholds: dict) -> AnalysisResult:
+    """Analyze SMART disk health metrics and provide recommendations.
+
+    Processes SMART data collected via SSH (node_smart_devices) or
+    from the local collector. Generates recommendations for failing
+    drives, bad sectors, high temperatures, and SSD endurance.
+    """
+    result = AnalysisResult(category="smart")
+    recommendations = []
+    lines = result.lines
+
+    lines.append("")
+    lines.append("=" * 50)
+    lines.append("SMART DISK HEALTH ANALYSIS")
+    lines.append("=" * 50)
+
+    smart_devices = metrics.get("node_smart_devices", [])
+
+    if not smart_devices:
+        lines.append("\u2139\ufe0f  SMART metrics not available.")
+        lines.append("   Install smartmontools on the remote host for disk health monitoring.")
+        result.missing_tools.append("smartctl")
+        return result
+
+    # Thresholds for SMART analysis
+    reallocated_thresh = thresholds.get("smart_reallocated_sectors", 10)
+    pending_thresh = thresholds.get("smart_pending_sectors", 5)
+    uncorrectable_thresh = thresholds.get("smart_uncorrectable_sectors", 1)
+    temp_thresh = thresholds.get("smart_temperature_c", 55)
+    ssd_life_thresh = thresholds.get("smart_ssd_life_pct", 20)
+
+    for device_info in smart_devices:
+        device = device_info.get("labels", {}).get("device", "unknown")
+        device_path = f"/dev/{device}"
+        health = device_info.get("health", "unknown")
+        health_code = device_info.get("health_code", 3)
+        attrs = device_info.get("attributes", {})
+
+        # Overall health status
+        if health == "failed":
+            lines.append(f"  \ud83d\udd34 Disk {device_path}: SMART health FAILED")
+            recommendations.append(Recommendation(
+                category="smart", severity="critical",
+                message=f"Disk {device_path} SMART health: FAILED. Data loss is imminent.",
+                detail="The disk has failed its SMART self-assessment. Back up data immediately and replace the drive.",
+                action=f"Back up critical data NOW. Schedule disk replacement. Run `smartctl -a {device_path}` for full details."
+            ))
+        elif health == "no_access":
+            lines.append(f"  \u2753 Disk {device_path}: SMART access denied (needs sudo)")
+            recommendations.append(Recommendation(
+                category="smart", severity="info",
+                message=f"Disk {device_path}: SMART data requires elevated privileges.",
+                detail="smartctl needs root/sudo access to read disk SMART data. Configure passwordless sudo for smartctl on the remote host.",
+                action="Add sudoers rule on the remote host to allow passwordless smartctl: ALL=(root) NOPASSWD: /usr/sbin/smartctl"
+            ))
+        elif health == "passed":
+            lines.append(f"  \u2705 Disk {device_path}: SMART health PASSED")
+        elif health_code == 1:
+            lines.append(f"  \u26a0\ufe0f Disk {device_path}: SMART health WARNING")
+            recommendations.append(Recommendation(
+                category="smart", severity="warning",
+                message=f"Disk {device_path} SMART health: WARNING. Disk is showing signs of degradation.",
+                action=f"Run `smartctl -a {device_path}` for details. Plan for replacement."
+            ))
+        else:
+            lines.append(f"  \u2753 Disk {device_path}: SMART health unknown")
+
+        # Reallocated sectors
+        reallocated = attrs.get("reallocated_sectors")
+        if reallocated is not None:
+            if reallocated > reallocated_thresh:
+                lines.append(f"    \ud83d\udd34 {reallocated} reallocated sectors (threshold: {reallocated_thresh})")
+                recommendations.append(Recommendation(
+                    category="smart", severity="critical",
+                    message=f"Disk {device_path} has {reallocated} reallocated sectors (threshold: {reallocated_thresh}).",
+                    detail="Reallocated sectors indicate the disk is remapping bad sectors to spares. Strong predictor of impending failure.",
+                    action=f"Back up data and plan disk replacement. Run `smartctl -a {device_path}` for details."
+                ))
+            elif reallocated > 0:
+                lines.append(f"    \u26a0\ufe0f {reallocated} reallocated sectors")
+                recommendations.append(Recommendation(
+                    category="smart", severity="warning",
+                    message=f"Disk {device_path} has {reallocated} reallocated sectors.",
+                    detail="Some sectors have been remapped. Monitor for growth.",
+                    action=f"Monitor with `smartctl -A {device_path}`. Back up data proactively."
+                ))
+
+        # Pending sectors
+        pending = attrs.get("pending_sectors")
+        if pending is not None:
+            if pending > pending_thresh:
+                lines.append(f"    \ud83d\udd34 {pending} pending sectors (threshold: {pending_thresh})")
+                recommendations.append(Recommendation(
+                    category="smart", severity="critical",
+                    message=f"Disk {device_path} has {pending} pending sectors (threshold: {pending_thresh}).",
+                    detail="Pending sectors are unreadable and awaiting rewrite/remapping.",
+                    action=f"Back up data immediately. Run `smartctl -a {device_path}` for full SMART report."
+                ))
+            elif pending > 0:
+                lines.append(f"    \u26a0\ufe0f {pending} pending sectors")
+                recommendations.append(Recommendation(
+                    category="smart", severity="warning",
+                    message=f"Disk {device_path} has {pending} pending sectors.",
+                    detail="Pending sectors indicate potential bad spots on the disk.",
+                    action=f"Monitor with `smartctl -A {device_path}`. Consider proactive replacement."
+                ))
+
+        # Uncorrectable sectors
+        uncorrectable = attrs.get("uncorrectable_sectors")
+        if uncorrectable is not None:
+            if uncorrectable > uncorrectable_thresh:
+                lines.append(f"    \ud83d\udd34 {uncorrectable} uncorrectable sectors (threshold: {uncorrectable_thresh})")
+                recommendations.append(Recommendation(
+                    category="smart", severity="critical",
+                    message=f"Disk {device_path} has {uncorrectable} uncorrectable sectors (threshold: {uncorrectable_thresh}).",
+                    detail="Uncorrectable sectors cannot be recovered by the drive's ECC. Data loss is occurring.",
+                    action=f"Replace the disk. Run `smartctl -a {device_path}` for details."
+                ))
+            elif uncorrectable > 0:
+                lines.append(f"    \u26a0\ufe0f {uncorrectable} uncorrectable sectors")
+                recommendations.append(Recommendation(
+                    category="smart", severity="warning",
+                    message=f"Disk {device_path} has {uncorrectable} uncorrectable sectors.",
+                    detail="Some sectors cannot be corrected. Monitor closely.",
+                    action=f"Run `smartctl -a {device_path}` and check for growing counts."
+                ))
+
+        # Temperature
+        temp = attrs.get("temperature")
+        if temp is not None:
+            if temp > temp_thresh:
+                lines.append(f"    \u26a0\ufe0f Temperature: {temp}\u00b0C (threshold: {temp_thresh}\u00b0C)")
+                recommendations.append(Recommendation(
+                    category="smart", severity="warning",
+                    message=f"Disk {device_path} temperature is {temp}\u00b0C (threshold: {temp_thresh}\u00b0C).",
+                    detail="High disk temperatures reduce lifespan and increase error rates.",
+                    action=f"Check cooling: ensure adequate airflow. Monitor with `smartctl -A {device_path}`."
+                ))
+            else:
+                lines.append(f"    \u2705 Temperature: {temp}\u00b0C")
+
+        # SSD life remaining
+        ssd_life = attrs.get("ssd_life_left")
+        if ssd_life is not None:
+            if ssd_life < ssd_life_thresh:
+                lines.append(f"    \ud83d\udd34 SSD life remaining: {ssd_life}% (threshold: {ssd_life_thresh}%)")
+                recommendations.append(Recommendation(
+                    category="smart", severity="critical",
+                    message=f"SSD {device_path} has {ssd_life}% life remaining (threshold: {ssd_life_thresh}%).",
+                    detail="The SSD is approaching its write endurance limit.",
+                    action=f"Back up data and order a replacement SSD. Run `smartctl -a {device_path}` for details."
+                ))
+            elif ssd_life < ssd_life_thresh + 10:
+                lines.append(f"    \u26a0\ufe0f SSD life remaining: {ssd_life}%")
+                recommendations.append(Recommendation(
+                    category="smart", severity="warning",
+                    message=f"SSD {device_path} has {ssd_life}% life remaining.",
+                    detail="SSD write endurance is declining. Plan for eventual replacement.",
+                    action=f"Monitor with `smartctl -A {device_path}`. Order replacement SSD proactively."
+                ))
+            else:
+                lines.append(f"    \u2705 SSD life remaining: {ssd_life}%")
+
+        # Spin retries (HDD)
+        spin_retries = attrs.get("spin_retries")
+        if spin_retries is not None and spin_retries > 0:
+            lines.append(f"    \u26a0\ufe0f {spin_retries} spin retry events")
+            recommendations.append(Recommendation(
+                category="smart", severity="warning",
+                message=f"Disk {device_path} has {spin_retries} spin retry events.",
+                detail="Spin retries indicate the drive had trouble spinning up. Can be an early sign of mechanical failure.",
+                action=f"Monitor with `smartctl -a {device_path}`. Consider replacing if retries increase."
+            ))
+
+        # Any attribute in a failing state
+        for attr_name, value in attrs.items():
+            if attr_name.endswith("_failed") and value != "-":
+                base_attr = attr_name.replace("_failed", "")
+                recommendations.append(Recommendation(
+                    category="smart", severity="critical",
+                    message=f"Disk {device_path}: SMART attribute {base_attr} is in {value} state.",
+                    detail="A SMART attribute has entered a pre-failure or failing state.",
+                    action=f"Run `smartctl -a {device_path}` for a complete SMART report. Back up data and plan for drive replacement."
+                ))
+
+    if not recommendations:
+        lines.append("  \u2705 All SMART-monitored disks are healthy")
+
+    result.recommendations = recommendations
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Formatting
 # ---------------------------------------------------------------------------
@@ -964,6 +1172,7 @@ def analyze_remote_node(
             previous_metrics=previous_metrics,
             node_address=node_address,
         ),
+        analyze_smart(metrics, thresholds),
     ]
 
     # Detect missing tools from absent metric groups (node_exporter path)
@@ -1091,6 +1300,7 @@ def analyze_ssh_node(
             previous_metrics=previous_metrics,
             node_address=node_address,
         ),
+        analyze_smart(metrics, thresholds),
     ]
 
     # Generate install suggestions from missing tools detected during SSH collection
