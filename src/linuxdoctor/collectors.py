@@ -1,6 +1,7 @@
 """Collectors for local host performance metrics."""
 
 import json
+import os
 import shutil
 import subprocess
 import platform
@@ -65,8 +66,46 @@ def _run_command_sudo(cmd: list[str], timeout: int = 10) -> tuple[str, Optional[
 
 
 def _tool_available(name: str) -> bool:
-    """Check if a command-line tool is available on PATH."""
-    return shutil.which(name) is not None
+    """Check if a command-line tool is available on PATH or in common sbin dirs."""
+    return _find_tool(name) is not None
+
+
+# Tools that commonly live in sbin directories (not on a normal user's PATH)
+# are resolved against these well-known locations in addition to PATH.
+SBIN_DIRS = ["/usr/sbin", "/sbin", "/usr/local/sbin"]
+
+# Explicit overrides, highest priority: SMARTCTL_PATH=/custom/smartctl
+_TOOL_PATH_ENV = {
+    "smartctl": "SMARTCTL_PATH",
+    "sar": "SAR_PATH",
+    "iostat": "IOSTAT_PATH",
+    "mpstat": "MPSTAT_PATH",
+    "vmstat": "VMSTAT_PATH",
+    "perf": "PERF_PATH",
+}
+
+
+def _find_tool(name: str) -> Optional[str]:
+    """
+    Resolve a tool to an executable path.
+
+    Order: 1) explicit env override (e.g. SMARTCTL_PATH), 2) PATH, 3) common
+    sbin directories (/usr/sbin, /sbin, /usr/local/sbin) where admin tools
+    like smartctl typically live on Linux.
+    """
+    env_var = _TOOL_PATH_ENV.get(name)
+    if env_var:
+        p = os.environ.get(env_var)
+        if p and os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    found = shutil.which(name)
+    if found:
+        return found
+    for d in SBIN_DIRS:
+        p = os.path.join(d, name)
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -841,9 +880,14 @@ def collect_sar_metrics() -> MetricCollection:
 # SMART Disk Health Collectors
 # ---------------------------------------------------------------------------
 
+def _smartctl_bin() -> str:
+    """Resolve the smartctl binary, honoring sbin dirs and SMARTCTL_PATH."""
+    return _find_tool("smartctl") or "smartctl"
+
+
 def _smartctl_scan_devices() -> list[str]:
     """Scan for disks using smartctl --scan and return device paths."""
-    stdout, err = _run_command_sudo(["smartctl", "--scan"], timeout=10)
+    stdout, err = _run_command_sudo([_smartctl_bin(), "--scan"], timeout=10)
     if err and not stdout:
         return []
     devices = []
@@ -947,7 +991,7 @@ def collect_smart_metrics() -> MetricCollection:
         safe_name = device.replace("/dev/", "").replace("/", "_")
 
         # Check overall health status: smartctl -H <device>
-        stdout, err = _run_command_sudo(["smartctl", "-H", device], timeout=15)
+        stdout, err = _run_command_sudo([_smartctl_bin(), "-H", device], timeout=15)
         if err and not stdout:
             # Try without sudo as fallback
             stdout, err = _run_command(["smartctl", "-H", device], timeout=15)
@@ -989,7 +1033,7 @@ def collect_smart_metrics() -> MetricCollection:
         ))
 
         # Collect key SMART attributes: smartctl -A <device>
-        stdout, err = _run_command_sudo(["smartctl", "-A", device], timeout=15)
+        stdout, err = _run_command_sudo([_smartctl_bin(), "-A", device], timeout=15)
         if err and not stdout:
             # Try without sudo as fallback
             stdout, err = _run_command(["smartctl", "-A", device], timeout=15)

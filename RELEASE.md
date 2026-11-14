@@ -1,3 +1,8 @@
+## 0.2.1
+
+- **SMART monitoring now works on hosts where smartctl lives in /usr/sbin**: Tool lookup now checks standard sbin directories (`/usr/sbin`, `/sbin`, `/usr/local/sbin`) in addition to PATH, so `smartctl` is found without per-host symlinks. Previously the smart category was silently skipped on such hosts.
+- **SMARTCTL_PATH override**: Set `SMARTCTL_PATH=/path/to/smartctl` (or SAR_PATH, IOSTAT_PATH, etc.) to point linuxdoctor at a tool in a non-standard location.
+
 ## 0.2.0
 
 - **Counter-aware remote analysis**: The `analyzenode` command now handles cumulative counter metrics correctly. Use `--resample` to take two samples and compute accurate per-second rates for context switches and disk I/O — no more false positives on long-running systems.
